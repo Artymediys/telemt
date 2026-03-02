@@ -276,6 +276,12 @@ async fn run_update_cycle(
         cfg.general.me_bind_stale_ttl_secs,
         cfg.general.me_secret_atomic_snapshot,
         cfg.general.me_deterministic_writer_sort,
+        cfg.general.me_single_endpoint_shadow_writers,
+        cfg.general.me_single_endpoint_outage_mode_enabled,
+        cfg.general.me_single_endpoint_outage_disable_quarantine,
+        cfg.general.me_single_endpoint_outage_backoff_min_ms,
+        cfg.general.me_single_endpoint_outage_backoff_max_ms,
+        cfg.general.me_single_endpoint_shadow_rotate_every_secs,
     );
 
     let required_cfg_snapshots = cfg.general.me_config_stable_snapshots.max(1);
@@ -478,6 +484,12 @@ pub async fn me_config_updater(
                     cfg.general.me_bind_stale_ttl_secs,
                     cfg.general.me_secret_atomic_snapshot,
                     cfg.general.me_deterministic_writer_sort,
+                    cfg.general.me_single_endpoint_shadow_writers,
+                    cfg.general.me_single_endpoint_outage_mode_enabled,
+                    cfg.general.me_single_endpoint_outage_disable_quarantine,
+                    cfg.general.me_single_endpoint_outage_backoff_min_ms,
+                    cfg.general.me_single_endpoint_outage_backoff_max_ms,
+                    cfg.general.me_single_endpoint_shadow_rotate_every_secs,
                 );
                 let new_secs = cfg.general.effective_update_every_secs().max(1);
                 if new_secs == update_every_secs {

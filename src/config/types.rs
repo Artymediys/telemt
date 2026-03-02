@@ -394,6 +394,31 @@ pub struct GeneralConfig {
     #[serde(default = "default_me_reconnect_fast_retry_count")]
     pub me_reconnect_fast_retry_count: u32,
 
+    /// Number of additional reserve writers for DC groups with exactly one endpoint.
+    #[serde(default = "default_me_single_endpoint_shadow_writers")]
+    pub me_single_endpoint_shadow_writers: u8,
+
+    /// Enable aggressive outage recovery mode for single-endpoint DC groups.
+    #[serde(default = "default_me_single_endpoint_outage_mode_enabled")]
+    pub me_single_endpoint_outage_mode_enabled: bool,
+
+    /// Ignore endpoint quarantine while in single-endpoint outage mode.
+    #[serde(default = "default_me_single_endpoint_outage_disable_quarantine")]
+    pub me_single_endpoint_outage_disable_quarantine: bool,
+
+    /// Minimum reconnect backoff in ms for single-endpoint outage mode.
+    #[serde(default = "default_me_single_endpoint_outage_backoff_min_ms")]
+    pub me_single_endpoint_outage_backoff_min_ms: u64,
+
+    /// Maximum reconnect backoff in ms for single-endpoint outage mode.
+    #[serde(default = "default_me_single_endpoint_outage_backoff_max_ms")]
+    pub me_single_endpoint_outage_backoff_max_ms: u64,
+
+    /// Periodic shadow writer rotation interval in seconds for single-endpoint DC groups.
+    /// Set to 0 to disable periodic shadow rotation.
+    #[serde(default = "default_me_single_endpoint_shadow_rotate_every_secs")]
+    pub me_single_endpoint_shadow_rotate_every_secs: u64,
+
     /// Connect attempts for the selected upstream before returning error/fallback.
     #[serde(default = "default_upstream_connect_retry_attempts")]
     pub upstream_connect_retry_attempts: u32,
@@ -603,6 +628,12 @@ impl Default for GeneralConfig {
             me_reconnect_backoff_base_ms: default_reconnect_backoff_base_ms(),
             me_reconnect_backoff_cap_ms: default_reconnect_backoff_cap_ms(),
             me_reconnect_fast_retry_count: default_me_reconnect_fast_retry_count(),
+            me_single_endpoint_shadow_writers: default_me_single_endpoint_shadow_writers(),
+            me_single_endpoint_outage_mode_enabled: default_me_single_endpoint_outage_mode_enabled(),
+            me_single_endpoint_outage_disable_quarantine: default_me_single_endpoint_outage_disable_quarantine(),
+            me_single_endpoint_outage_backoff_min_ms: default_me_single_endpoint_outage_backoff_min_ms(),
+            me_single_endpoint_outage_backoff_max_ms: default_me_single_endpoint_outage_backoff_max_ms(),
+            me_single_endpoint_shadow_rotate_every_secs: default_me_single_endpoint_shadow_rotate_every_secs(),
             upstream_connect_retry_attempts: default_upstream_connect_retry_attempts(),
             upstream_connect_retry_backoff_ms: default_upstream_connect_retry_backoff_ms(),
             upstream_unhealthy_fail_threshold: default_upstream_unhealthy_fail_threshold(),

@@ -1,6 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use socket2::{SockRef, TcpKeepalive};
 #[cfg(target_os = "linux")]
 use libc;
@@ -34,6 +36,8 @@ use super::codec::{
 use super::wire::{extract_ip_material, IpMaterial};
 use super::MePool;
 
+const ME_KDF_DRIFT_STRICT: bool = false;
+
 /// Result of a successful ME handshake with timings.
 pub(crate) struct HandshakeOutput {
     pub rd: ReadHalf<TcpStream>,
@@ -47,6 +51,22 @@ pub(crate) struct HandshakeOutput {
 }
 
 impl MePool {
+    fn kdf_material_fingerprint(
+        local_addr_nat: SocketAddr,
+        peer_addr_nat: SocketAddr,
+        client_port_for_kdf: u16,
+        reflected: Option<SocketAddr>,
+        socks_bound_addr: Option<SocketAddr>,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        local_addr_nat.hash(&mut hasher);
+        peer_addr_nat.hash(&mut hasher);
+        client_port_for_kdf.hash(&mut hasher);
+        reflected.hash(&mut hasher);
+        socks_bound_addr.hash(&mut hasher);
+        hasher.finish()
+    }
+
     async fn resolve_dc_idx_for_endpoint(&self, addr: SocketAddr) -> Option<i16> {
         if addr.is_ipv4() {
             let map = self.proxy_map_v4.read().await;
@@ -343,6 +363,33 @@ impl MePool {
             .map(|bound| bound.port())
             .filter(|port| *port != 0)
             .unwrap_or(local_addr_nat.port());
+        let kdf_fingerprint = Self::kdf_material_fingerprint(
+            local_addr_nat,
+            peer_addr_nat,
+            client_port_for_kdf,
+            reflected,
+            socks_bound_addr,
+        );
+        let mut kdf_fingerprint_guard = self.kdf_material_fingerprint.lock().await;
+        if let Some(prev_fingerprint) = kdf_fingerprint_guard.get(&peer_addr_nat).copied()
+            && prev_fingerprint != kdf_fingerprint
+        {
+            self.stats.increment_me_kdf_drift_total();
+            warn!(
+                %peer_addr_nat,
+                %local_addr_nat,
+                client_port_for_kdf,
+                "ME KDF input drift detected for endpoint"
+            );
+            if ME_KDF_DRIFT_STRICT {
+                return Err(ProxyError::InvalidHandshake(
+                    "ME KDF input drift detected (strict mode)".to_string(),
+                ));
+            }
+        }
+        kdf_fingerprint_guard.insert(peer_addr_nat, kdf_fingerprint);
+        drop(kdf_fingerprint_guard);
+
         let client_port_bytes = client_port_for_kdf.to_le_bytes();
 
         let server_ip = extract_ip_material(peer_addr_nat);
@@ -540,6 +587,8 @@ impl MePool {
                     } else {
                         -1
                     };
+                    self.stats.increment_me_handshake_reject_total();
+                    self.stats.increment_me_handshake_error_code(err_code);
                     return Err(ProxyError::InvalidHandshake(format!(
                         "ME rejected handshake (error={err_code})"
                     )));

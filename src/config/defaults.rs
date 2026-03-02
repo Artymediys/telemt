@@ -8,6 +8,7 @@ const DEFAULT_STUN_TCP_FALLBACK: bool = true;
 const DEFAULT_MIDDLE_PROXY_WARM_STANDBY: usize = 16;
 const DEFAULT_ME_RECONNECT_MAX_CONCURRENT_PER_DC: u32 = 8;
 const DEFAULT_ME_RECONNECT_FAST_RETRY_COUNT: u32 = 16;
+const DEFAULT_ME_SINGLE_ENDPOINT_SHADOW_WRITERS: u8 = 2;
 const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 3;
 const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 4;
 const DEFAULT_LISTEN_ADDR_IPV6: &str = "::";
@@ -158,6 +159,30 @@ pub(crate) fn default_me_reconnect_max_concurrent_per_dc() -> u32 {
 
 pub(crate) fn default_me_reconnect_fast_retry_count() -> u32 {
     DEFAULT_ME_RECONNECT_FAST_RETRY_COUNT
+}
+
+pub(crate) fn default_me_single_endpoint_shadow_writers() -> u8 {
+    DEFAULT_ME_SINGLE_ENDPOINT_SHADOW_WRITERS
+}
+
+pub(crate) fn default_me_single_endpoint_outage_mode_enabled() -> bool {
+    true
+}
+
+pub(crate) fn default_me_single_endpoint_outage_disable_quarantine() -> bool {
+    true
+}
+
+pub(crate) fn default_me_single_endpoint_outage_backoff_min_ms() -> u64 {
+    250
+}
+
+pub(crate) fn default_me_single_endpoint_outage_backoff_max_ms() -> u64 {
+    3000
+}
+
+pub(crate) fn default_me_single_endpoint_shadow_rotate_every_secs() -> u64 {
+    900
 }
 
 pub(crate) fn default_upstream_connect_retry_attempts() -> u32 {

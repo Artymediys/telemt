@@ -46,6 +46,7 @@ pub(crate) async fn reader_loop(
             _ = cancel.cancelled() => return Ok(()),
         };
         if n == 0 {
+            stats.increment_me_reader_eof_total();
             return Err(ProxyError::Io(std::io::Error::new(
                 ErrorKind::UnexpectedEof,
                 "ME socket closed by peer",

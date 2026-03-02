@@ -32,8 +32,21 @@ pub struct Stats {
     me_keepalive_timeout: AtomicU64,
     me_reconnect_attempts: AtomicU64,
     me_reconnect_success: AtomicU64,
+    me_handshake_reject_total: AtomicU64,
+    me_reader_eof_total: AtomicU64,
     me_crc_mismatch: AtomicU64,
     me_seq_mismatch: AtomicU64,
+    me_endpoint_quarantine_total: AtomicU64,
+    me_kdf_drift_total: AtomicU64,
+    me_hardswap_pending_reuse_total: AtomicU64,
+    me_hardswap_pending_ttl_expired_total: AtomicU64,
+    me_single_endpoint_outage_enter_total: AtomicU64,
+    me_single_endpoint_outage_exit_total: AtomicU64,
+    me_single_endpoint_outage_reconnect_attempt_total: AtomicU64,
+    me_single_endpoint_outage_reconnect_success_total: AtomicU64,
+    me_single_endpoint_quarantine_bypass_total: AtomicU64,
+    me_single_endpoint_shadow_rotate_total: AtomicU64,
+    me_handshake_error_codes: DashMap<i32, AtomicU64>,
     me_route_drop_no_conn: AtomicU64,
     me_route_drop_channel_closed: AtomicU64,
     me_route_drop_queue_full: AtomicU64,
@@ -170,6 +183,26 @@ impl Stats {
     pub fn increment_me_reconnect_success(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_reconnect_success.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_handshake_reject_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_handshake_reject_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_handshake_error_code(&self, code: i32) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        let entry = self
+            .me_handshake_error_codes
+            .entry(code)
+            .or_insert_with(|| AtomicU64::new(0));
+        entry.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn increment_me_reader_eof_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_reader_eof_total.fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn increment_me_crc_mismatch(&self) {
@@ -333,6 +366,65 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_endpoint_quarantine_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_endpoint_quarantine_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_kdf_drift_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_kdf_drift_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_hardswap_pending_reuse_total(&self) {
+        if self.telemetry_me_allows_debug() {
+            self.me_hardswap_pending_reuse_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_hardswap_pending_ttl_expired_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_hardswap_pending_ttl_expired_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_single_endpoint_outage_enter_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_single_endpoint_outage_enter_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_single_endpoint_outage_exit_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_single_endpoint_outage_exit_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_single_endpoint_outage_reconnect_attempt_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_single_endpoint_outage_reconnect_attempt_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_single_endpoint_outage_reconnect_success_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_single_endpoint_outage_reconnect_success_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_single_endpoint_quarantine_bypass_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_single_endpoint_quarantine_bypass_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_single_endpoint_shadow_rotate_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_single_endpoint_shadow_rotate_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn get_connects_all(&self) -> u64 { self.connects_all.load(Ordering::Relaxed) }
     pub fn get_connects_bad(&self) -> u64 { self.connects_bad.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_sent(&self) -> u64 { self.me_keepalive_sent.load(Ordering::Relaxed) }
@@ -341,8 +433,61 @@ impl Stats {
     pub fn get_me_keepalive_timeout(&self) -> u64 { self.me_keepalive_timeout.load(Ordering::Relaxed) }
     pub fn get_me_reconnect_attempts(&self) -> u64 { self.me_reconnect_attempts.load(Ordering::Relaxed) }
     pub fn get_me_reconnect_success(&self) -> u64 { self.me_reconnect_success.load(Ordering::Relaxed) }
+    pub fn get_me_handshake_reject_total(&self) -> u64 {
+        self.me_handshake_reject_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_reader_eof_total(&self) -> u64 {
+        self.me_reader_eof_total.load(Ordering::Relaxed)
+    }
     pub fn get_me_crc_mismatch(&self) -> u64 { self.me_crc_mismatch.load(Ordering::Relaxed) }
     pub fn get_me_seq_mismatch(&self) -> u64 { self.me_seq_mismatch.load(Ordering::Relaxed) }
+    pub fn get_me_endpoint_quarantine_total(&self) -> u64 {
+        self.me_endpoint_quarantine_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_kdf_drift_total(&self) -> u64 {
+        self.me_kdf_drift_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_hardswap_pending_reuse_total(&self) -> u64 {
+        self.me_hardswap_pending_reuse_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_hardswap_pending_ttl_expired_total(&self) -> u64 {
+        self.me_hardswap_pending_ttl_expired_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_single_endpoint_outage_enter_total(&self) -> u64 {
+        self.me_single_endpoint_outage_enter_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_single_endpoint_outage_exit_total(&self) -> u64 {
+        self.me_single_endpoint_outage_exit_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_single_endpoint_outage_reconnect_attempt_total(&self) -> u64 {
+        self.me_single_endpoint_outage_reconnect_attempt_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_single_endpoint_outage_reconnect_success_total(&self) -> u64 {
+        self.me_single_endpoint_outage_reconnect_success_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_single_endpoint_quarantine_bypass_total(&self) -> u64 {
+        self.me_single_endpoint_quarantine_bypass_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_single_endpoint_shadow_rotate_total(&self) -> u64 {
+        self.me_single_endpoint_shadow_rotate_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_handshake_error_code_counts(&self) -> Vec<(i32, u64)> {
+        let mut out: Vec<(i32, u64)> = self
+            .me_handshake_error_codes
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
+            .collect();
+        out.sort_by_key(|(code, _)| *code);
+        out
+    }
     pub fn get_me_route_drop_no_conn(&self) -> u64 { self.me_route_drop_no_conn.load(Ordering::Relaxed) }
     pub fn get_me_route_drop_channel_closed(&self) -> u64 {
         self.me_route_drop_channel_closed.load(Ordering::Relaxed)

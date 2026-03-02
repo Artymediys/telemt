@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::crypto::SecureRandom;
+use crate::network::IpFamily;
 
-use super::pool::MePool;
+use super::pool::{MePool, RefillDcKey, WriterContour};
 
 const ME_FLAP_UPTIME_THRESHOLD_SECS: u64 = 20;
 const ME_FLAP_QUARANTINE_SECS: u64 = 25;
@@ -27,6 +28,7 @@ impl MePool {
         let mut guard = self.endpoint_quarantine.lock().await;
         guard.retain(|_, expiry| *expiry > Instant::now());
         guard.insert(addr, until);
+        self.stats.increment_me_endpoint_quarantine_total();
         warn!(
             %addr,
             uptime_ms = uptime.as_millis(),
@@ -84,14 +86,76 @@ impl MePool {
         if endpoints.is_empty() {
             return false;
         }
-        let guard = self.refill_inflight.lock().await;
-        endpoints.iter().any(|addr| guard.contains(addr))
+
+        {
+            let guard = self.refill_inflight.lock().await;
+            if endpoints.iter().any(|addr| guard.contains(addr)) {
+                return true;
+            }
+        }
+
+        let dc_keys = self.resolve_refill_dc_keys_for_endpoints(endpoints).await;
+        if dc_keys.is_empty() {
+            return false;
+        }
+        let guard = self.refill_inflight_dc.lock().await;
+        dc_keys.iter().any(|key| guard.contains(key))
+    }
+
+    async fn resolve_refill_dc_key_for_addr(&self, addr: SocketAddr) -> Option<RefillDcKey> {
+        let family = if addr.is_ipv4() {
+            IpFamily::V4
+        } else {
+            IpFamily::V6
+        };
+        let map = self.proxy_map_for_family(family).await;
+        for (dc, endpoints) in map {
+            if endpoints
+                .into_iter()
+                .any(|(ip, port)| SocketAddr::new(ip, port) == addr)
+            {
+                return Some(RefillDcKey {
+                    dc: dc.abs(),
+                    family,
+                });
+            }
+        }
+        None
+    }
+
+    async fn resolve_refill_dc_keys_for_endpoints(
+        &self,
+        endpoints: &[SocketAddr],
+    ) -> HashSet<RefillDcKey> {
+        let mut out = HashSet::<RefillDcKey>::new();
+        for addr in endpoints {
+            if let Some(key) = self.resolve_refill_dc_key_for_addr(*addr).await {
+                out.insert(key);
+            }
+        }
+        out
     }
 
     pub(super) async fn connect_endpoints_round_robin(
         self: &Arc<Self>,
         endpoints: &[SocketAddr],
         rng: &SecureRandom,
+    ) -> bool {
+        self.connect_endpoints_round_robin_with_generation_contour(
+            endpoints,
+            rng,
+            self.current_generation(),
+            WriterContour::Active,
+        )
+        .await
+    }
+
+    pub(super) async fn connect_endpoints_round_robin_with_generation_contour(
+        self: &Arc<Self>,
+        endpoints: &[SocketAddr],
+        rng: &SecureRandom,
+        generation: u64,
+        contour: WriterContour,
     ) -> bool {
         let candidates = self.connectable_endpoints(endpoints).await;
         if candidates.is_empty() {
@@ -101,7 +165,10 @@ impl MePool {
         for offset in 0..candidates.len() {
             let idx = (start + offset) % candidates.len();
             let addr = candidates[idx];
-            match self.connect_one(addr, rng).await {
+            match self
+                .connect_one_with_generation_contour(addr, rng, generation, contour)
+                .await
+            {
                 Ok(()) => return true,
                 Err(e) => debug!(%addr, error = %e, "ME connect failed during round-robin warmup"),
             }
@@ -225,6 +292,9 @@ impl MePool {
     pub(crate) fn trigger_immediate_refill(self: &Arc<Self>, addr: SocketAddr) {
         let pool = Arc::clone(self);
         tokio::spawn(async move {
+            let dc_endpoints = pool.endpoints_for_same_dc(addr).await;
+            let dc_keys = pool.resolve_refill_dc_keys_for_endpoints(&dc_endpoints).await;
+
             {
                 let mut guard = pool.refill_inflight.lock().await;
                 if !guard.insert(addr) {
@@ -232,6 +302,19 @@ impl MePool {
                     return;
                 }
             }
+
+            if !dc_keys.is_empty() {
+                let mut dc_guard = pool.refill_inflight_dc.lock().await;
+                if dc_keys.iter().any(|key| dc_guard.contains(key)) {
+                    pool.stats.increment_me_refill_skipped_inflight_total();
+                    drop(dc_guard);
+                    let mut guard = pool.refill_inflight.lock().await;
+                    guard.remove(&addr);
+                    return;
+                }
+                dc_guard.extend(dc_keys.iter().copied());
+            }
+
             pool.stats.increment_me_refill_triggered_total();
 
             let restored = pool.refill_writer_after_loss(addr).await;
@@ -241,6 +324,13 @@ impl MePool {
 
             let mut guard = pool.refill_inflight.lock().await;
             guard.remove(&addr);
+            drop(guard);
+            if !dc_keys.is_empty() {
+                let mut dc_guard = pool.refill_inflight_dc.lock().await;
+                for key in &dc_keys {
+                    dc_guard.remove(key);
+                }
+            }
         });
     }
 }

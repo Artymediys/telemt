@@ -255,6 +255,32 @@ impl ProxyConfig {
             ));
         }
 
+        if config.general.me_single_endpoint_shadow_writers > 32 {
+            return Err(ProxyError::Config(
+                "general.me_single_endpoint_shadow_writers must be within [0, 32]".to_string(),
+            ));
+        }
+
+        if config.general.me_single_endpoint_outage_backoff_min_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_single_endpoint_outage_backoff_min_ms must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_single_endpoint_outage_backoff_max_ms == 0 {
+            return Err(ProxyError::Config(
+                "general.me_single_endpoint_outage_backoff_max_ms must be > 0".to_string(),
+            ));
+        }
+
+        if config.general.me_single_endpoint_outage_backoff_min_ms
+            > config.general.me_single_endpoint_outage_backoff_max_ms
+        {
+            return Err(ProxyError::Config(
+                "general.me_single_endpoint_outage_backoff_min_ms must be <= general.me_single_endpoint_outage_backoff_max_ms".to_string(),
+            ));
+        }
+
         if config.general.beobachten_minutes == 0 {
             return Err(ProxyError::Config(
                 "general.beobachten_minutes must be > 0".to_string(),
@@ -593,6 +619,30 @@ mod tests {
             default_me_reconnect_fast_retry_count()
         );
         assert_eq!(
+            cfg.general.me_single_endpoint_shadow_writers,
+            default_me_single_endpoint_shadow_writers()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_outage_mode_enabled,
+            default_me_single_endpoint_outage_mode_enabled()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_outage_disable_quarantine,
+            default_me_single_endpoint_outage_disable_quarantine()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_outage_backoff_min_ms,
+            default_me_single_endpoint_outage_backoff_min_ms()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_outage_backoff_max_ms,
+            default_me_single_endpoint_outage_backoff_max_ms()
+        );
+        assert_eq!(
+            cfg.general.me_single_endpoint_shadow_rotate_every_secs,
+            default_me_single_endpoint_shadow_rotate_every_secs()
+        );
+        assert_eq!(
             cfg.general.upstream_connect_retry_attempts,
             default_upstream_connect_retry_attempts()
         );
@@ -629,6 +679,30 @@ mod tests {
         assert_eq!(
             general.me_reconnect_fast_retry_count,
             default_me_reconnect_fast_retry_count()
+        );
+        assert_eq!(
+            general.me_single_endpoint_shadow_writers,
+            default_me_single_endpoint_shadow_writers()
+        );
+        assert_eq!(
+            general.me_single_endpoint_outage_mode_enabled,
+            default_me_single_endpoint_outage_mode_enabled()
+        );
+        assert_eq!(
+            general.me_single_endpoint_outage_disable_quarantine,
+            default_me_single_endpoint_outage_disable_quarantine()
+        );
+        assert_eq!(
+            general.me_single_endpoint_outage_backoff_min_ms,
+            default_me_single_endpoint_outage_backoff_min_ms()
+        );
+        assert_eq!(
+            general.me_single_endpoint_outage_backoff_max_ms,
+            default_me_single_endpoint_outage_backoff_max_ms()
+        );
+        assert_eq!(
+            general.me_single_endpoint_shadow_rotate_every_secs,
+            default_me_single_endpoint_shadow_rotate_every_secs()
         );
         assert_eq!(
             general.upstream_connect_retry_attempts,
@@ -811,6 +885,49 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let err = ProxyConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("general.me_reinit_every_secs must be > 0"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_single_endpoint_outage_backoff_range_is_validated() {
+        let toml = r#"
+            [general]
+            me_single_endpoint_outage_backoff_min_ms = 4000
+            me_single_endpoint_outage_backoff_max_ms = 3000
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_single_endpoint_outage_backoff_range_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains(
+            "general.me_single_endpoint_outage_backoff_min_ms must be <= general.me_single_endpoint_outage_backoff_max_ms"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_single_endpoint_shadow_writers_too_large_is_rejected() {
+        let toml = r#"
+            [general]
+            me_single_endpoint_shadow_writers = 33
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_single_endpoint_shadow_writers_limit_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.me_single_endpoint_shadow_writers must be within [0, 32]"));
         let _ = std::fs::remove_file(path);
     }
 

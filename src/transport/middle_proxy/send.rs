@@ -13,6 +13,7 @@ use crate::protocol::constants::RPC_CLOSE_EXT_U32;
 
 use super::MePool;
 use super::codec::WriterCommand;
+use super::pool::WriterContour;
 use super::wire::build_proxy_req_payload;
 use rand::seq::SliceRandom;
 use super::registry::ConnMeta;
@@ -101,7 +102,14 @@ impl MePool {
                 ws.clone()
             };
 
-            let mut candidate_indices = self.candidate_indices_for_dc(&writers_snapshot, target_dc).await;
+            let mut candidate_indices = self
+                .candidate_indices_for_dc(&writers_snapshot, target_dc, false)
+                .await;
+            if candidate_indices.is_empty() {
+                candidate_indices = self
+                    .candidate_indices_for_dc(&writers_snapshot, target_dc, true)
+                    .await;
+            }
             if candidate_indices.is_empty() {
                 // Emergency connect-on-demand
                 if emergency_attempts >= 3 {
@@ -127,7 +135,14 @@ impl MePool {
                         let ws2 = self.writers.read().await;
                         writers_snapshot = ws2.clone();
                         drop(ws2);
-                        candidate_indices = self.candidate_indices_for_dc(&writers_snapshot, target_dc).await;
+                        candidate_indices = self
+                            .candidate_indices_for_dc(&writers_snapshot, target_dc, false)
+                            .await;
+                        if candidate_indices.is_empty() {
+                            candidate_indices = self
+                                .candidate_indices_for_dc(&writers_snapshot, target_dc, true)
+                                .await;
+                        }
                         if !candidate_indices.is_empty() {
                             break;
                         }
@@ -143,6 +158,7 @@ impl MePool {
                     let left = &writers_snapshot[*lhs];
                     let right = &writers_snapshot[*rhs];
                     let left_key = (
+                        self.writer_contour_rank_for_selection(left),
                         (left.generation < self.current_generation()) as usize,
                         left.degraded.load(Ordering::Relaxed) as usize,
                         Reverse(left.tx.capacity()),
@@ -150,6 +166,7 @@ impl MePool {
                         left.id,
                     );
                     let right_key = (
+                        self.writer_contour_rank_for_selection(right),
                         (right.generation < self.current_generation()) as usize,
                         right.degraded.load(Ordering::Relaxed) as usize,
                         Reverse(right.tx.capacity()),
@@ -163,7 +180,12 @@ impl MePool {
                     let w = &writers_snapshot[*idx];
                     let degraded = w.degraded.load(Ordering::Relaxed);
                     let stale = (w.generation < self.current_generation()) as usize;
-                    (stale, degraded as usize, Reverse(w.tx.capacity()))
+                    (
+                        self.writer_contour_rank_for_selection(w),
+                        stale,
+                        degraded as usize,
+                        Reverse(w.tx.capacity()),
+                    )
                 });
             }
 
@@ -257,6 +279,7 @@ impl MePool {
         &self,
         writers: &[super::pool::MeWriter],
         target_dc: i16,
+        include_warm: bool,
     ) -> Vec<usize> {
         let key = target_dc as i32;
         let mut preferred = Vec::<SocketAddr>::new();
@@ -300,13 +323,13 @@ impl MePool {
 
         if preferred.is_empty() {
             return (0..writers.len())
-                .filter(|i| self.writer_accepts_new_binding(&writers[*i]))
+                .filter(|i| self.writer_eligible_for_selection(&writers[*i], include_warm))
                 .collect();
         }
 
         let mut out = Vec::new();
         for (idx, w) in writers.iter().enumerate() {
-            if !self.writer_accepts_new_binding(w) {
+            if !self.writer_eligible_for_selection(w, include_warm) {
                 continue;
             }
             if preferred.contains(&w.addr) {
@@ -315,10 +338,33 @@ impl MePool {
         }
         if out.is_empty() {
             return (0..writers.len())
-                .filter(|i| self.writer_accepts_new_binding(&writers[*i]))
+                .filter(|i| self.writer_eligible_for_selection(&writers[*i], include_warm))
                 .collect();
         }
         out
     }
 
+    fn writer_eligible_for_selection(
+        &self,
+        writer: &super::pool::MeWriter,
+        include_warm: bool,
+    ) -> bool {
+        if !self.writer_accepts_new_binding(writer) {
+            return false;
+        }
+
+        match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
+            WriterContour::Active => true,
+            WriterContour::Warm => include_warm,
+            WriterContour::Draining => true,
+        }
+    }
+
+    fn writer_contour_rank_for_selection(&self, writer: &super::pool::MeWriter) -> usize {
+        match WriterContour::from_u8(writer.contour.load(Ordering::Relaxed)) {
+            WriterContour::Active => 0,
+            WriterContour::Warm => 1,
+            WriterContour::Draining => 2,
+        }
+    }
 }

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -15,7 +15,7 @@ use crate::error::{ProxyError, Result};
 use crate::protocol::constants::RPC_PING_U32;
 
 use super::codec::{RpcWriter, WriterCommand};
-use super::pool::{MePool, MeWriter};
+use super::pool::{MePool, MeWriter, WriterContour};
 use super::reader::reader_loop;
 use super::registry::BoundConn;
 
@@ -43,6 +43,22 @@ impl MePool {
     }
 
     pub(crate) async fn connect_one(self: &Arc<Self>, addr: SocketAddr, rng: &SecureRandom) -> Result<()> {
+        self.connect_one_with_generation_contour(
+            addr,
+            rng,
+            self.current_generation(),
+            WriterContour::Active,
+        )
+        .await
+    }
+
+    pub(super) async fn connect_one_with_generation_contour(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        rng: &SecureRandom,
+        generation: u64,
+        contour: WriterContour,
+    ) -> Result<()> {
         let secret_len = self.proxy_secret.read().await.secret.len();
         if secret_len < 32 {
             return Err(ProxyError::Proxy("proxy-secret too short for ME auth".into()));
@@ -52,7 +68,7 @@ impl MePool {
         let hs = self.handshake_only(stream, addr, upstream_egress, rng).await?;
 
         let writer_id = self.next_writer_id.fetch_add(1, Ordering::Relaxed);
-        let generation = self.current_generation();
+        let contour = Arc::new(AtomicU8::new(contour.as_u8()));
         let cancel = CancellationToken::new();
         let degraded = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
@@ -89,6 +105,7 @@ impl MePool {
             id: writer_id,
             addr,
             generation,
+            contour: contour.clone(),
             created_at: Instant::now(),
             tx: tx.clone(),
             cancel: cancel.clone(),
@@ -305,6 +322,8 @@ impl MePool {
                 if !already_draining {
                     self.stats.increment_pool_drain_active();
                 }
+                w.contour
+                    .store(WriterContour::Draining.as_u8(), Ordering::Relaxed);
                 w.draining.store(true, Ordering::Relaxed);
                 true
             } else {

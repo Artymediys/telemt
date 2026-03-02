@@ -274,6 +274,43 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
         }
     );
 
+    let _ = writeln!(out, "# HELP telemt_me_handshake_reject_total ME handshake rejects from upstream");
+    let _ = writeln!(out, "# TYPE telemt_me_handshake_reject_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_handshake_reject_total {}",
+        if me_allows_normal {
+            stats.get_me_handshake_reject_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(out, "# HELP telemt_me_handshake_error_code_total ME handshake reject errors by code");
+    let _ = writeln!(out, "# TYPE telemt_me_handshake_error_code_total counter");
+    if me_allows_normal {
+        for (error_code, count) in stats.get_me_handshake_error_code_counts() {
+            let _ = writeln!(
+                out,
+                "telemt_me_handshake_error_code_total{{error_code=\"{}\"}} {}",
+                error_code,
+                count
+            );
+        }
+    }
+
+    let _ = writeln!(out, "# HELP telemt_me_reader_eof_total ME reader EOF terminations");
+    let _ = writeln!(out, "# TYPE telemt_me_reader_eof_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_reader_eof_total {}",
+        if me_allows_normal {
+            stats.get_me_reader_eof_total()
+        } else {
+            0
+        }
+    );
+
     let _ = writeln!(out, "# HELP telemt_me_crc_mismatch_total ME CRC mismatches");
     let _ = writeln!(out, "# TYPE telemt_me_crc_mismatch_total counter");
     let _ = writeln!(
@@ -380,6 +417,171 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
         "telemt_me_socks_kdf_policy_total{{policy=\"compat\",outcome=\"fallback\"}} {}",
         if me_allows_debug {
             stats.get_me_socks_kdf_compat_fallback()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_endpoint_quarantine_total ME endpoint quarantines due to rapid flaps"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_endpoint_quarantine_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_endpoint_quarantine_total {}",
+        if me_allows_normal {
+            stats.get_me_endpoint_quarantine_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(out, "# HELP telemt_me_kdf_drift_total ME KDF input drift detections");
+    let _ = writeln!(out, "# TYPE telemt_me_kdf_drift_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_kdf_drift_total {}",
+        if me_allows_normal {
+            stats.get_me_kdf_drift_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_hardswap_pending_reuse_total Hardswap cycles that reused an existing pending generation"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_hardswap_pending_reuse_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_hardswap_pending_reuse_total {}",
+        if me_allows_debug {
+            stats.get_me_hardswap_pending_reuse_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_hardswap_pending_ttl_expired_total Pending hardswap generations reset by TTL expiration"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_hardswap_pending_ttl_expired_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_hardswap_pending_ttl_expired_total {}",
+        if me_allows_normal {
+            stats.get_me_hardswap_pending_ttl_expired_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_single_endpoint_outage_enter_total Single-endpoint DC outage transitions to active state"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_single_endpoint_outage_enter_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_single_endpoint_outage_enter_total {}",
+        if me_allows_normal {
+            stats.get_me_single_endpoint_outage_enter_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_single_endpoint_outage_exit_total Single-endpoint DC outage recovery transitions"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_single_endpoint_outage_exit_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_single_endpoint_outage_exit_total {}",
+        if me_allows_normal {
+            stats.get_me_single_endpoint_outage_exit_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_single_endpoint_outage_reconnect_attempt_total Reconnect attempts performed during single-endpoint outages"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_single_endpoint_outage_reconnect_attempt_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_single_endpoint_outage_reconnect_attempt_total {}",
+        if me_allows_normal {
+            stats.get_me_single_endpoint_outage_reconnect_attempt_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_single_endpoint_outage_reconnect_success_total Successful reconnect attempts during single-endpoint outages"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_single_endpoint_outage_reconnect_success_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_single_endpoint_outage_reconnect_success_total {}",
+        if me_allows_normal {
+            stats.get_me_single_endpoint_outage_reconnect_success_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_single_endpoint_quarantine_bypass_total Outage reconnect attempts that bypassed quarantine"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_single_endpoint_quarantine_bypass_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_single_endpoint_quarantine_bypass_total {}",
+        if me_allows_normal {
+            stats.get_me_single_endpoint_quarantine_bypass_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_single_endpoint_shadow_rotate_total Successful periodic shadow rotations for single-endpoint DC groups"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_single_endpoint_shadow_rotate_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_single_endpoint_shadow_rotate_total {}",
+        if me_allows_normal {
+            stats.get_me_single_endpoint_shadow_rotate_total()
         } else {
             0
         }
