@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, RwLock};
 use tokio::sync::mpsc::error::TrySendError;
@@ -51,6 +51,8 @@ struct RegistryInner {
     writer_for_conn: HashMap<u64, u64>,
     conns_for_writer: HashMap<u64, HashSet<u64>>,
     meta: HashMap<u64, ConnMeta>,
+    last_meta_for_writer: HashMap<u64, ConnMeta>,
+    writer_idle_since_epoch_secs: HashMap<u64, u64>,
 }
 
 impl RegistryInner {
@@ -61,6 +63,8 @@ impl RegistryInner {
             writer_for_conn: HashMap::new(),
             conns_for_writer: HashMap::new(),
             meta: HashMap::new(),
+            last_meta_for_writer: HashMap::new(),
+            writer_idle_since_epoch_secs: HashMap::new(),
         }
     }
 }
@@ -74,6 +78,13 @@ pub struct ConnRegistry {
 }
 
 impl ConnRegistry {
+    fn now_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
     pub fn new() -> Self {
         let start = rand::random::<u64>() | 1;
         Self {
@@ -121,8 +132,16 @@ impl ConnRegistry {
         inner.map.remove(&id);
         inner.meta.remove(&id);
         if let Some(writer_id) = inner.writer_for_conn.remove(&id) {
-            if let Some(set) = inner.conns_for_writer.get_mut(&writer_id) {
+            let became_empty = if let Some(set) = inner.conns_for_writer.get_mut(&writer_id) {
                 set.remove(&id);
+                set.is_empty()
+            } else {
+                false
+            };
+            if became_empty {
+                inner
+                    .writer_idle_since_epoch_secs
+                    .insert(writer_id, Self::now_epoch_secs());
             }
             return Some(writer_id);
         }
@@ -191,14 +210,35 @@ impl ConnRegistry {
         meta: ConnMeta,
     ) {
         let mut inner = self.inner.write().await;
-        inner.meta.entry(conn_id).or_insert(meta);
+        inner.meta.entry(conn_id).or_insert(meta.clone());
         inner.writer_for_conn.insert(conn_id, writer_id);
+        inner.last_meta_for_writer.insert(writer_id, meta);
+        inner.writer_idle_since_epoch_secs.remove(&writer_id);
         inner.writers.entry(writer_id).or_insert_with(|| tx.clone());
         inner
             .conns_for_writer
             .entry(writer_id)
             .or_insert_with(HashSet::new)
             .insert(conn_id);
+    }
+
+    pub async fn mark_writer_idle(&self, writer_id: u64) {
+        let mut inner = self.inner.write().await;
+        inner.conns_for_writer.entry(writer_id).or_insert_with(HashSet::new);
+        inner
+            .writer_idle_since_epoch_secs
+            .entry(writer_id)
+            .or_insert(Self::now_epoch_secs());
+    }
+
+    pub async fn get_last_writer_meta(&self, writer_id: u64) -> Option<ConnMeta> {
+        let inner = self.inner.read().await;
+        inner.last_meta_for_writer.get(&writer_id).cloned()
+    }
+
+    pub async fn writer_idle_since_snapshot(&self) -> HashMap<u64, u64> {
+        let inner = self.inner.read().await;
+        inner.writer_idle_since_epoch_secs.clone()
     }
 
     pub async fn get_writer(&self, conn_id: u64) -> Option<ConnWriter> {
@@ -211,6 +251,8 @@ impl ConnRegistry {
     pub async fn writer_lost(&self, writer_id: u64) -> Vec<BoundConn> {
         let mut inner = self.inner.write().await;
         inner.writers.remove(&writer_id);
+        inner.last_meta_for_writer.remove(&writer_id);
+        inner.writer_idle_since_epoch_secs.remove(&writer_id);
         let conns = inner
             .conns_for_writer
             .remove(&writer_id)

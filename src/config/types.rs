@@ -162,8 +162,8 @@ impl MeBindStaleMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MeFloorMode {
-    #[default]
     Static,
+    #[default]
     Adaptive,
 }
 
@@ -356,6 +356,11 @@ pub struct GeneralConfig {
     #[serde(default = "default_true")]
     pub me_keepalive_payload_random: bool,
 
+    /// Interval in seconds for service RPC_PROXY_REQ activity signals to ME.
+    /// 0 disables service activity signals.
+    #[serde(default = "default_rpc_proxy_req_every")]
+    pub rpc_proxy_req_every: u64,
+
     /// Max pending ciphertext buffer per client writer (bytes).
     /// Controls FakeTLS backpressure vs throughput.
     #[serde(default = "default_crypto_pending_buffer")]
@@ -471,6 +476,10 @@ pub struct GeneralConfig {
     /// Consecutive failed requests before upstream is marked unhealthy.
     #[serde(default = "default_upstream_unhealthy_fail_threshold")]
     pub upstream_unhealthy_fail_threshold: u32,
+
+    /// Skip additional retries for hard non-transient upstream connect errors.
+    #[serde(default = "default_upstream_connect_failfast_hard_errors")]
+    pub upstream_connect_failfast_hard_errors: bool,
 
     /// Ignore STUN/interface IP mismatch (keep using Middle Proxy even if NAT detected).
     #[serde(default)]
@@ -662,6 +671,7 @@ impl Default for GeneralConfig {
             me_keepalive_interval_secs: default_keepalive_interval(),
             me_keepalive_jitter_secs: default_keepalive_jitter(),
             me_keepalive_payload_random: default_true(),
+            rpc_proxy_req_every: default_rpc_proxy_req_every(),
             me_warmup_stagger_enabled: default_true(),
             me_warmup_step_delay_ms: default_warmup_step_delay_ms(),
             me_warmup_step_jitter_ms: default_warmup_step_jitter_ms(),
@@ -682,6 +692,7 @@ impl Default for GeneralConfig {
             upstream_connect_retry_attempts: default_upstream_connect_retry_attempts(),
             upstream_connect_retry_backoff_ms: default_upstream_connect_retry_backoff_ms(),
             upstream_unhealthy_fail_threshold: default_upstream_unhealthy_fail_threshold(),
+            upstream_connect_failfast_hard_errors: default_upstream_connect_failfast_hard_errors(),
             stun_iface_mismatch_ignore: false,
             unknown_dc_log_path: default_unknown_dc_log_path(),
             log_level: LogLevel::Normal,

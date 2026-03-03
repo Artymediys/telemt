@@ -12,8 +12,8 @@ const DEFAULT_ME_SINGLE_ENDPOINT_SHADOW_WRITERS: u8 = 2;
 const DEFAULT_ME_ADAPTIVE_FLOOR_IDLE_SECS: u64 = 90;
 const DEFAULT_ME_ADAPTIVE_FLOOR_MIN_WRITERS_SINGLE_ENDPOINT: u8 = 1;
 const DEFAULT_ME_ADAPTIVE_FLOOR_RECOVER_GRACE_SECS: u64 = 180;
-const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 3;
-const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 4;
+const DEFAULT_UPSTREAM_CONNECT_RETRY_ATTEMPTS: u32 = 2;
+const DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD: u32 = 5;
 const DEFAULT_LISTEN_ADDR_IPV6: &str = "::";
 const DEFAULT_ACCESS_USER: &str = "default";
 const DEFAULT_ACCESS_SECRET: &str = "00000000000000000000000000000000";
@@ -205,11 +205,19 @@ pub(crate) fn default_upstream_connect_retry_attempts() -> u32 {
 }
 
 pub(crate) fn default_upstream_connect_retry_backoff_ms() -> u64 {
-    250
+    100
 }
 
 pub(crate) fn default_upstream_unhealthy_fail_threshold() -> u32 {
     DEFAULT_UPSTREAM_UNHEALTHY_FAIL_THRESHOLD
+}
+
+pub(crate) fn default_upstream_connect_failfast_hard_errors() -> bool {
+    false
+}
+
+pub(crate) fn default_rpc_proxy_req_every() -> u64 {
+    0
 }
 
 pub(crate) fn default_crypto_pending_buffer() -> usize {
