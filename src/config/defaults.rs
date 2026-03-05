@@ -141,6 +141,14 @@ pub(crate) fn default_proxy_secret_path() -> Option<String> {
     Some("proxy-secret".to_string())
 }
 
+pub(crate) fn default_proxy_config_v4_cache_path() -> Option<String> {
+    Some("cache/proxy-config-v4.txt".to_string())
+}
+
+pub(crate) fn default_proxy_config_v6_cache_path() -> Option<String> {
+    Some("cache/proxy-config-v6.txt".to_string())
+}
+
 pub(crate) fn default_middle_proxy_nat_stun() -> Option<String> {
     None
 }

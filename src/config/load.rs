@@ -203,6 +203,22 @@ impl ProxyConfig {
 
         sanitize_ad_tag(&mut config.general.ad_tag);
 
+        if let Some(path) = &config.general.proxy_config_v4_cache_path
+            && path.trim().is_empty()
+        {
+            return Err(ProxyError::Config(
+                "general.proxy_config_v4_cache_path cannot be empty when provided".to_string(),
+            ));
+        }
+
+        if let Some(path) = &config.general.proxy_config_v6_cache_path
+            && path.trim().is_empty()
+        {
+            return Err(ProxyError::Config(
+                "general.proxy_config_v6_cache_path cannot be empty when provided".to_string(),
+            ));
+        }
+
         if let Some(update_every) = config.general.update_every {
             if update_every == 0 {
                 return Err(ProxyError::Config(
@@ -692,6 +708,14 @@ mod tests {
             default_me2dc_fallback()
         );
         assert_eq!(
+            cfg.general.proxy_config_v4_cache_path,
+            default_proxy_config_v4_cache_path()
+        );
+        assert_eq!(
+            cfg.general.proxy_config_v6_cache_path,
+            default_proxy_config_v6_cache_path()
+        );
+        assert_eq!(
             cfg.general.me_single_endpoint_shadow_writers,
             default_me_single_endpoint_shadow_writers()
         );
@@ -801,6 +825,14 @@ mod tests {
             default_me_init_retry_attempts()
         );
         assert_eq!(general.me2dc_fallback, default_me2dc_fallback());
+        assert_eq!(
+            general.proxy_config_v4_cache_path,
+            default_proxy_config_v4_cache_path()
+        );
+        assert_eq!(
+            general.proxy_config_v6_cache_path,
+            default_proxy_config_v6_cache_path()
+        );
         assert_eq!(
             general.me_single_endpoint_shadow_writers,
             default_me_single_endpoint_shadow_writers()
@@ -1265,6 +1297,42 @@ mod tests {
             crate::config::MeRouteNoWriterMode::InlineRecoveryLegacy
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn proxy_config_cache_paths_empty_are_rejected() {
+        let toml = r#"
+            [general]
+            proxy_config_v4_cache_path = "   "
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_proxy_config_v4_cache_path_empty_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.proxy_config_v4_cache_path cannot be empty"));
+        let _ = std::fs::remove_file(path);
+
+        let toml_v6 = r#"
+            [general]
+            proxy_config_v6_cache_path = ""
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let path_v6 = dir.join("telemt_proxy_config_v6_cache_path_empty_test.toml");
+        std::fs::write(&path_v6, toml_v6).unwrap();
+        let err_v6 = ProxyConfig::load(&path_v6).unwrap_err().to_string();
+        assert!(err_v6.contains("general.proxy_config_v6_cache_path cannot be empty"));
+        let _ = std::fs::remove_file(path_v6);
     }
 
     #[test]

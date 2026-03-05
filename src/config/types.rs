@@ -343,6 +343,14 @@ pub struct GeneralConfig {
     #[serde(default = "default_proxy_secret_path")]
     pub proxy_secret_path: Option<String>,
 
+    /// Optional path to cache raw getProxyConfig (IPv4) snapshot for startup fallback.
+    #[serde(default = "default_proxy_config_v4_cache_path")]
+    pub proxy_config_v4_cache_path: Option<String>,
+
+    /// Optional path to cache raw getProxyConfigV6 snapshot for startup fallback.
+    #[serde(default = "default_proxy_config_v6_cache_path")]
+    pub proxy_config_v6_cache_path: Option<String>,
+
     /// Global ad_tag (32 hex chars from @MTProxybot). Fallback when user has no per-user tag in access.user_ad_tags.
     #[serde(default)]
     pub ad_tag: Option<String>,
@@ -727,6 +735,8 @@ impl Default for GeneralConfig {
             use_middle_proxy: default_true(),
             ad_tag: None,
             proxy_secret_path: default_proxy_secret_path(),
+            proxy_config_v4_cache_path: default_proxy_config_v4_cache_path(),
+            proxy_config_v6_cache_path: default_proxy_config_v6_cache_path(),
             middle_proxy_nat_ip: None,
             middle_proxy_nat_probe: default_true(),
             middle_proxy_nat_stun: default_middle_proxy_nat_stun(),

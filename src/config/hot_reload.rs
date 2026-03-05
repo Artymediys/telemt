@@ -405,6 +405,12 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig, non_hot_changed: b
         warned = true;
         warn!("config reload: general.me2dc_fallback changed; restart required");
     }
+    if old.general.proxy_config_v4_cache_path != new.general.proxy_config_v4_cache_path
+        || old.general.proxy_config_v6_cache_path != new.general.proxy_config_v6_cache_path
+    {
+        warned = true;
+        warn!("config reload: general.proxy_config_*_cache_path changed; restart required");
+    }
     if old.general.me_keepalive_enabled != new.general.me_keepalive_enabled
         || old.general.me_keepalive_interval_secs != new.general.me_keepalive_interval_secs
         || old.general.me_keepalive_jitter_secs != new.general.me_keepalive_jitter_secs

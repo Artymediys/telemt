@@ -278,6 +278,11 @@ impl ConnRegistry {
         Some(ConnWriter { writer_id, tx: writer })
     }
 
+    pub async fn active_conn_ids(&self) -> Vec<u64> {
+        let inner = self.inner.read().await;
+        inner.writer_for_conn.keys().copied().collect()
+    }
+
     pub async fn writer_lost(&self, writer_id: u64) -> Vec<BoundConn> {
         let mut inner = self.inner.write().await;
         inner.writers.remove(&writer_id);
