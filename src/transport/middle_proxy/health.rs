@@ -124,7 +124,7 @@ async fn check_family(
         IpFamily::V6 => pool.proxy_map_v6.read().await,
     };
     for (dc, addrs) in map_guard.iter() {
-        let entry = dc_endpoints.entry(*dc).or_default();
+        let entry = dc_endpoints.entry(dc.abs()).or_default();
         for (ip, port) in addrs.iter().copied() {
             entry.push(SocketAddr::new(ip, port));
         }

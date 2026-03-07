@@ -54,6 +54,7 @@ impl MePool {
                     && let Some(addrs) = guard.get(&k).cloned()
                 {
                     guard.insert(-k, addrs);
+                    changed = true;
                 }
             }
         }
@@ -65,8 +66,13 @@ impl MePool {
                     && let Some(addrs) = guard.get(&k).cloned()
                 {
                     guard.insert(-k, addrs);
+                    changed = true;
                 }
             }
+        }
+        if changed {
+            self.rebuild_endpoint_dc_map().await;
+            self.writer_available.notify_waiters();
         }
         if changed {
             SnapshotApplyOutcome::AppliedChanged

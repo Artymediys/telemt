@@ -792,33 +792,8 @@ impl MePool {
     }
 
     pub(super) async fn resolve_dc_for_endpoint(&self, addr: SocketAddr) -> i32 {
-        let map_guard = if addr.is_ipv4() {
-            self.proxy_map_v4.read().await
-        } else {
-            self.proxy_map_v6.read().await
-        };
-
-        let mut matched_dc: Option<i32> = None;
-        let mut ambiguous = false;
-        for (dc, addrs) in map_guard.iter() {
-            if addrs
-                .iter()
-                .any(|(ip, port)| SocketAddr::new(*ip, *port) == addr)
-            {
-                match matched_dc {
-                    None => matched_dc = Some(*dc),
-                    Some(prev_dc) if prev_dc == *dc => {}
-                    Some(_) => {
-                        ambiguous = true;
-                        break;
-                    }
-                }
-            }
-        }
-        drop(map_guard);
-
-        if !ambiguous
-            && let Some(dc) = matched_dc
+        if let Some(cached) = self.endpoint_dc_map.read().await.get(&addr).copied()
+            && let Some(dc) = cached
         {
             return dc;
         }
@@ -834,5 +809,49 @@ impl MePool {
             IpFamily::V4 => self.proxy_map_v4.read().await.clone(),
             IpFamily::V6 => self.proxy_map_v6.read().await.clone(),
         }
+    }
+
+    fn merge_endpoint_dc(
+        endpoint_dc_map: &mut HashMap<SocketAddr, Option<i32>>,
+        dc: i32,
+        ip: IpAddr,
+        port: u16,
+    ) {
+        let endpoint = SocketAddr::new(ip, port);
+        match endpoint_dc_map.get_mut(&endpoint) {
+            None => {
+                endpoint_dc_map.insert(endpoint, Some(dc));
+            }
+            Some(existing) => {
+                if existing.is_some_and(|existing_dc| existing_dc != dc) {
+                    *existing = None;
+                }
+            }
+        }
+    }
+
+    fn build_endpoint_dc_map_from_maps(
+        map_v4: &HashMap<i32, Vec<(IpAddr, u16)>>,
+        map_v6: &HashMap<i32, Vec<(IpAddr, u16)>>,
+    ) -> HashMap<SocketAddr, Option<i32>> {
+        let mut endpoint_dc_map = HashMap::<SocketAddr, Option<i32>>::new();
+        for (dc, endpoints) in map_v4 {
+            for (ip, port) in endpoints {
+                Self::merge_endpoint_dc(&mut endpoint_dc_map, *dc, *ip, *port);
+            }
+        }
+        for (dc, endpoints) in map_v6 {
+            for (ip, port) in endpoints {
+                Self::merge_endpoint_dc(&mut endpoint_dc_map, *dc, *ip, *port);
+            }
+        }
+        endpoint_dc_map
+    }
+
+    pub(super) async fn rebuild_endpoint_dc_map(&self) {
+        let map_v4 = self.proxy_map_v4.read().await.clone();
+        let map_v6 = self.proxy_map_v6.read().await.clone();
+        let rebuilt = Self::build_endpoint_dc_map_from_maps(&map_v4, &map_v6);
+        *self.endpoint_dc_map.write().await = rebuilt;
     }
 }
