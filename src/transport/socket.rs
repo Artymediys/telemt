@@ -1,6 +1,8 @@
 //! TCP Socket Configuration
 
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::io::Result;
 use std::net::{SocketAddr, IpAddr};
@@ -44,6 +46,7 @@ pub fn configure_tcp_socket(
 pub fn configure_client_socket(
     stream: &TcpStream,
     keepalive_secs: u64,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     ack_timeout_secs: u64,
 ) -> Result<()> {
     let socket = socket2::SockRef::from(stream);
@@ -373,6 +376,7 @@ fn listening_inodes_for_port(addr: SocketAddr) -> HashSet<u64> {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     
     #[tokio::test]
@@ -395,6 +399,115 @@ mod tests {
             }
             panic!("configure_tcp_socket failed: {e}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_configure_client_socket() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("bind failed: {e}"),
+        };
+        let addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => panic!("local_addr failed: {e}"),
+        };
+
+        let stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("connect failed: {e}"),
+        };
+
+        if let Err(e) = configure_client_socket(&stream, 30, 30) {
+            if e.kind() == ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("configure_client_socket failed: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_configure_client_socket_zero_ack_timeout() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("bind failed: {e}"),
+        };
+        let addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => panic!("local_addr failed: {e}"),
+        };
+
+        let stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("connect failed: {e}"),
+        };
+
+        if let Err(e) = configure_client_socket(&stream, 30, 0) {
+            if e.kind() == ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("configure_client_socket with zero ack timeout failed: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_configure_client_socket_roundtrip_io() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("bind failed: {e}"),
+        };
+        let addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => panic!("local_addr failed: {e}"),
+        };
+
+        let server_task = tokio::spawn(async move {
+            let (mut accepted, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => panic!("accept failed: {e}"),
+            };
+            let mut payload = [0u8; 4];
+            if let Err(e) = accepted.read_exact(&mut payload).await {
+                panic!("server read_exact failed: {e}");
+            }
+            if let Err(e) = accepted.write_all(b"pong").await {
+                panic!("server write_all failed: {e}");
+            }
+            payload
+        });
+
+        let mut stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("connect failed: {e}"),
+        };
+
+        if let Err(e) = configure_client_socket(&stream, 30, 30) {
+            if e.kind() == ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("configure_client_socket failed: {e}");
+        }
+
+        if let Err(e) = stream.write_all(b"ping").await {
+            panic!("client write_all failed: {e}");
+        }
+
+        let mut reply = [0u8; 4];
+        if let Err(e) = stream.read_exact(&mut reply).await {
+            panic!("client read_exact failed: {e}");
+        }
+        assert_eq!(&reply, b"pong");
+
+        let server_seen = match server_task.await {
+            Ok(value) => value,
+            Err(e) => panic!("server task join failed: {e}"),
+        };
+        assert_eq!(&server_seen, b"ping");
     }
     
     #[test]
