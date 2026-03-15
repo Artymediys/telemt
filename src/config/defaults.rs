@@ -639,6 +639,10 @@ pub(crate) fn default_user_max_unique_ips_window_secs() -> u64 {
     DEFAULT_USER_MAX_UNIQUE_IPS_WINDOW_SECS
 }
 
+pub(crate) fn default_user_max_unique_ips_global_each() -> usize {
+    0
+}
+
 // Custom deserializer helpers
 
 #[derive(Deserialize)]

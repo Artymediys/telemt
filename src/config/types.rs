@@ -1323,6 +1323,11 @@ pub struct AccessConfig {
     #[serde(default)]
     pub user_max_unique_ips: HashMap<String, usize>,
 
+    /// Global per-user unique IP limit applied when a user has no individual override.
+    /// `0` disables the inherited limit.
+    #[serde(default = "default_user_max_unique_ips_global_each")]
+    pub user_max_unique_ips_global_each: usize,
+
     #[serde(default)]
     pub user_max_unique_ips_mode: UserMaxUniqueIpsMode,
 
@@ -1348,6 +1353,7 @@ impl Default for AccessConfig {
             user_expirations: HashMap::new(),
             user_data_quota: HashMap::new(),
             user_max_unique_ips: HashMap::new(),
+            user_max_unique_ips_global_each: default_user_max_unique_ips_global_each(),
             user_max_unique_ips_mode: UserMaxUniqueIpsMode::default(),
             user_max_unique_ips_window_secs: default_user_max_unique_ips_window_secs(),
             replay_check_len: default_replay_check_len(),
