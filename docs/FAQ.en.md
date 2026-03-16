@@ -83,6 +83,13 @@ To specify a domain in the links, add to the `[general.links]` section of the co
 public_host = "proxy.example.com"
 ```
 
+### Server connection limit
+Limits the total number of open connections to the server:
+```toml
+[server]
+max_connections = 10000    # 0 - unlimited, 10000 - default
+```
+
 ### Upstream Manager
 To specify an upstream, add to the `[[upstreams]]` section of the config.toml file:
 #### Binding to IP
