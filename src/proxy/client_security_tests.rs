@@ -92,8 +92,9 @@ async fn short_tls_probe_is_masked_through_client_pipeline() {
     accept_task.await.unwrap();
 }
 
-fn make_valid_tls_client_hello(secret: &[u8], timestamp: u32) -> Vec<u8> {
-    let tls_len: usize = 600;
+fn make_valid_tls_client_hello_with_len(secret: &[u8], timestamp: u32, tls_len: usize) -> Vec<u8> {
+    assert!(tls_len <= u16::MAX as usize, "TLS length must fit into record header");
+
     let total_len = 5 + tls_len;
     let mut handshake = vec![0x42u8; total_len];
 
@@ -115,6 +116,10 @@ fn make_valid_tls_client_hello(secret: &[u8], timestamp: u32) -> Vec<u8> {
 
     handshake[tls::TLS_DIGEST_POS..tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN].copy_from_slice(&digest);
     handshake
+}
+
+fn make_valid_tls_client_hello(secret: &[u8], timestamp: u32) -> Vec<u8> {
+    make_valid_tls_client_hello_with_len(secret, timestamp, 600)
 }
 
 fn wrap_tls_application_data(payload: &[u8]) -> Vec<u8> {
@@ -627,5 +632,636 @@ async fn concurrent_limit_rejections_from_mixed_ips_leave_no_ip_footprint() {
         stats.get_ip_reservation_rollback_tcp_limit_total(),
         0,
         "No rollback should occur under concurrent rejection storms"
+    );
+}
+
+#[tokio::test]
+async fn oversized_tls_record_is_masked_in_generic_stream_pipeline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    let probe = [
+        0x16,
+        0x03,
+        0x01,
+        (((MAX_TLS_RECORD_SIZE + 1) >> 8) & 0xff) as u8,
+        ((MAX_TLS_RECORD_SIZE + 1) & 0xff) as u8,
+    ];
+    let backend_reply = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec();
+
+    let accept_task = tokio::spawn({
+        let backend_reply = backend_reply.clone();
+        async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut got = [0u8; 5];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, probe);
+            stream.write_all(&backend_reply).await.unwrap();
+        }
+    });
+
+    let mut cfg = ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.censorship.mask = true;
+    cfg.censorship.mask_unix_sock = None;
+    cfg.censorship.mask_host = Some("127.0.0.1".to_string());
+    cfg.censorship.mask_port = backend_addr.port();
+    cfg.censorship.mask_proxy_protocol = 0;
+
+    let config = Arc::new(cfg);
+    let stats = Arc::new(Stats::new());
+    let bad_before = stats.get_connects_bad();
+    let upstream_manager = Arc::new(UpstreamManager::new(
+        vec![UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+    let replay_checker = Arc::new(ReplayChecker::new(128, Duration::from_secs(60)));
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    let beobachten = Arc::new(BeobachtenStore::new());
+
+    let (server_side, mut client_side) = duplex(4096);
+    let peer: SocketAddr = "203.0.113.123:55123".parse().unwrap();
+
+    let handler = tokio::spawn(handle_client_stream(
+        server_side,
+        peer,
+        config,
+        stats.clone(),
+        upstream_manager,
+        replay_checker,
+        buffer_pool,
+        rng,
+        None,
+        route_runtime,
+        None,
+        ip_tracker,
+        beobachten,
+        false,
+    ));
+
+    client_side.write_all(&probe).await.unwrap();
+    let mut observed = vec![0u8; backend_reply.len()];
+    client_side.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, backend_reply);
+
+    drop(client_side);
+    let _ = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .unwrap()
+        .unwrap();
+    accept_task.await.unwrap();
+
+    assert_eq!(
+        stats.get_connects_bad(),
+        bad_before + 1,
+        "Oversized TLS probe must be classified as bad"
+    );
+}
+
+#[tokio::test]
+async fn oversized_tls_record_is_masked_in_client_handler_pipeline() {
+    let mask_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = mask_listener.local_addr().unwrap();
+
+    let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front_listener.local_addr().unwrap();
+
+    let probe = [
+        0x16,
+        0x03,
+        0x01,
+        (((MAX_TLS_RECORD_SIZE + 1) >> 8) & 0xff) as u8,
+        ((MAX_TLS_RECORD_SIZE + 1) & 0xff) as u8,
+    ];
+    let backend_reply = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec();
+
+    let mask_accept_task = tokio::spawn({
+        let backend_reply = backend_reply.clone();
+        async move {
+            let (mut stream, _) = mask_listener.accept().await.unwrap();
+            let mut got = [0u8; 5];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, probe);
+            stream.write_all(&backend_reply).await.unwrap();
+        }
+    });
+
+    let mut cfg = ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.censorship.mask = true;
+    cfg.censorship.mask_unix_sock = None;
+    cfg.censorship.mask_host = Some("127.0.0.1".to_string());
+    cfg.censorship.mask_port = backend_addr.port();
+    cfg.censorship.mask_proxy_protocol = 0;
+
+    let config = Arc::new(cfg);
+    let stats = Arc::new(Stats::new());
+    let upstream_manager = Arc::new(UpstreamManager::new(
+        vec![UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+    let replay_checker = Arc::new(ReplayChecker::new(128, Duration::from_secs(60)));
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    let beobachten = Arc::new(BeobachtenStore::new());
+
+    let server_task = {
+        let config = config.clone();
+        let stats = stats.clone();
+        let upstream_manager = upstream_manager.clone();
+        let replay_checker = replay_checker.clone();
+        let buffer_pool = buffer_pool.clone();
+        let rng = rng.clone();
+        let route_runtime = route_runtime.clone();
+        let ip_tracker = ip_tracker.clone();
+        let beobachten = beobachten.clone();
+
+        tokio::spawn(async move {
+            let (stream, peer) = front_listener.accept().await.unwrap();
+            let real_peer_report = Arc::new(std::sync::Mutex::new(None));
+            ClientHandler::new(
+                stream,
+                peer,
+                config,
+                stats,
+                upstream_manager,
+                replay_checker,
+                buffer_pool,
+                rng,
+                None,
+                route_runtime,
+                None,
+                ip_tracker,
+                beobachten,
+                false,
+                real_peer_report,
+            )
+            .run()
+            .await
+        })
+    };
+
+    let mut client = TcpStream::connect(front_addr).await.unwrap();
+    client.write_all(&probe).await.unwrap();
+
+    let mut observed = vec![0u8; backend_reply.len()];
+    client.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, backend_reply);
+
+    tokio::time::timeout(Duration::from_secs(3), mask_accept_task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    drop(client);
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tls_record_len_511_is_rejected_in_generic_stream_pipeline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    let probe = [0x16, 0x03, 0x01, 0x01, 0xff];
+    let backend_reply = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec();
+
+    let accept_task = tokio::spawn({
+        let backend_reply = backend_reply.clone();
+        async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut got = [0u8; 5];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, probe);
+            stream.write_all(&backend_reply).await.unwrap();
+        }
+    });
+
+    let mut cfg = ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.censorship.mask = true;
+    cfg.censorship.mask_unix_sock = None;
+    cfg.censorship.mask_host = Some("127.0.0.1".to_string());
+    cfg.censorship.mask_port = backend_addr.port();
+    cfg.censorship.mask_proxy_protocol = 0;
+
+    let config = Arc::new(cfg);
+    let stats = Arc::new(Stats::new());
+    let bad_before = stats.get_connects_bad();
+    let upstream_manager = Arc::new(UpstreamManager::new(
+        vec![UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+    let replay_checker = Arc::new(ReplayChecker::new(128, Duration::from_secs(60)));
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    let beobachten = Arc::new(BeobachtenStore::new());
+
+    let (server_side, mut client_side) = duplex(4096);
+    let peer: SocketAddr = "203.0.113.130:55130".parse().unwrap();
+
+    let handler = tokio::spawn(handle_client_stream(
+        server_side,
+        peer,
+        config,
+        stats.clone(),
+        upstream_manager,
+        replay_checker,
+        buffer_pool,
+        rng,
+        None,
+        route_runtime,
+        None,
+        ip_tracker,
+        beobachten,
+        false,
+    ));
+
+    client_side.write_all(&probe).await.unwrap();
+    let mut observed = vec![0u8; backend_reply.len()];
+    client_side.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, backend_reply);
+
+    drop(client_side);
+    let _ = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .unwrap()
+        .unwrap();
+    accept_task.await.unwrap();
+
+    assert_eq!(
+        stats.get_connects_bad(),
+        bad_before + 1,
+        "TLS record length 511 must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn tls_record_len_511_is_rejected_in_client_handler_pipeline() {
+    let mask_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = mask_listener.local_addr().unwrap();
+
+    let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front_listener.local_addr().unwrap();
+
+    let probe = [0x16, 0x03, 0x01, 0x01, 0xff];
+    let backend_reply = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec();
+
+    let mask_accept_task = tokio::spawn({
+        let backend_reply = backend_reply.clone();
+        async move {
+            let (mut stream, _) = mask_listener.accept().await.unwrap();
+            let mut got = [0u8; 5];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, probe);
+            stream.write_all(&backend_reply).await.unwrap();
+        }
+    });
+
+    let mut cfg = ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.censorship.mask = true;
+    cfg.censorship.mask_unix_sock = None;
+    cfg.censorship.mask_host = Some("127.0.0.1".to_string());
+    cfg.censorship.mask_port = backend_addr.port();
+    cfg.censorship.mask_proxy_protocol = 0;
+
+    let config = Arc::new(cfg);
+    let stats = Arc::new(Stats::new());
+    let upstream_manager = Arc::new(UpstreamManager::new(
+        vec![UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+    let replay_checker = Arc::new(ReplayChecker::new(128, Duration::from_secs(60)));
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    let beobachten = Arc::new(BeobachtenStore::new());
+
+    let server_task = {
+        let config = config.clone();
+        let stats = stats.clone();
+        let upstream_manager = upstream_manager.clone();
+        let replay_checker = replay_checker.clone();
+        let buffer_pool = buffer_pool.clone();
+        let rng = rng.clone();
+        let route_runtime = route_runtime.clone();
+        let ip_tracker = ip_tracker.clone();
+        let beobachten = beobachten.clone();
+
+        tokio::spawn(async move {
+            let (stream, peer) = front_listener.accept().await.unwrap();
+            let real_peer_report = Arc::new(std::sync::Mutex::new(None));
+            ClientHandler::new(
+                stream,
+                peer,
+                config,
+                stats,
+                upstream_manager,
+                replay_checker,
+                buffer_pool,
+                rng,
+                None,
+                route_runtime,
+                None,
+                ip_tracker,
+                beobachten,
+                false,
+                real_peer_report,
+            )
+            .run()
+            .await
+        })
+    };
+
+    let mut client = TcpStream::connect(front_addr).await.unwrap();
+    client.write_all(&probe).await.unwrap();
+
+    let mut observed = vec![0u8; backend_reply.len()];
+    client.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, backend_reply);
+
+    tokio::time::timeout(Duration::from_secs(3), mask_accept_task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    drop(client);
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tls_record_len_16384_is_accepted_in_generic_stream_pipeline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+
+    let secret = [0x55u8; 16];
+    let client_hello = make_valid_tls_client_hello_with_len(&secret, 0, MAX_TLS_RECORD_SIZE);
+
+    let mut cfg = ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.censorship.mask = true;
+    cfg.censorship.mask_unix_sock = None;
+    cfg.censorship.mask_host = Some("127.0.0.1".to_string());
+    cfg.censorship.mask_port = backend_addr.port();
+    cfg.censorship.mask_proxy_protocol = 0;
+    cfg.access.ignore_time_skew = true;
+    cfg.access
+        .users
+        .insert("user".to_string(), "55555555555555555555555555555555".to_string());
+
+    let config = Arc::new(cfg);
+    let stats = Arc::new(Stats::new());
+    let bad_before = stats.get_connects_bad();
+    let upstream_manager = Arc::new(UpstreamManager::new(
+        vec![UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+    let replay_checker = Arc::new(ReplayChecker::new(128, Duration::from_secs(60)));
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    let beobachten = Arc::new(BeobachtenStore::new());
+
+    let (server_side, mut client_side) = duplex(131072);
+    let peer: SocketAddr = "198.51.100.55:56055".parse().unwrap();
+
+    let handler = tokio::spawn(handle_client_stream(
+        server_side,
+        peer,
+        config,
+        stats.clone(),
+        upstream_manager,
+        replay_checker,
+        buffer_pool,
+        rng,
+        None,
+        route_runtime,
+        None,
+        ip_tracker,
+        beobachten,
+        false,
+    ));
+
+    client_side.write_all(&client_hello).await.unwrap();
+    let mut record_header = [0u8; 5];
+    client_side.read_exact(&mut record_header).await.unwrap();
+    assert_eq!(record_header[0], 0x16, "Valid max-length ClientHello must be accepted");
+
+    drop(client_side);
+    let handler_result = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(handler_result.is_err());
+
+    let no_mask_connect = tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
+    assert!(
+        no_mask_connect.is_err(),
+        "Valid max-length ClientHello must not trigger mask fallback"
+    );
+
+    assert_eq!(
+        bad_before,
+        stats.get_connects_bad(),
+        "Valid max-length ClientHello must not increment bad counter"
+    );
+}
+
+#[tokio::test]
+async fn tls_record_len_16384_is_accepted_in_client_handler_pipeline() {
+    let mask_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = mask_listener.local_addr().unwrap();
+
+    let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front_listener.local_addr().unwrap();
+
+    let secret = [0x66u8; 16];
+    let client_hello = make_valid_tls_client_hello_with_len(&secret, 0, MAX_TLS_RECORD_SIZE);
+
+    let mut cfg = ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.censorship.mask = true;
+    cfg.censorship.mask_unix_sock = None;
+    cfg.censorship.mask_host = Some("127.0.0.1".to_string());
+    cfg.censorship.mask_port = backend_addr.port();
+    cfg.censorship.mask_proxy_protocol = 0;
+    cfg.access.ignore_time_skew = true;
+    cfg.access
+        .users
+        .insert("user".to_string(), "66666666666666666666666666666666".to_string());
+
+    let config = Arc::new(cfg);
+    let stats = Arc::new(Stats::new());
+    let bad_before = stats.get_connects_bad();
+    let upstream_manager = Arc::new(UpstreamManager::new(
+        vec![UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+    let replay_checker = Arc::new(ReplayChecker::new(128, Duration::from_secs(60)));
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    let beobachten = Arc::new(BeobachtenStore::new());
+
+    let server_task = {
+        let config = config.clone();
+        let stats = stats.clone();
+        let upstream_manager = upstream_manager.clone();
+        let replay_checker = replay_checker.clone();
+        let buffer_pool = buffer_pool.clone();
+        let rng = rng.clone();
+        let route_runtime = route_runtime.clone();
+        let ip_tracker = ip_tracker.clone();
+        let beobachten = beobachten.clone();
+
+        tokio::spawn(async move {
+            let (stream, peer) = front_listener.accept().await.unwrap();
+            let real_peer_report = Arc::new(std::sync::Mutex::new(None));
+            ClientHandler::new(
+                stream,
+                peer,
+                config,
+                stats,
+                upstream_manager,
+                replay_checker,
+                buffer_pool,
+                rng,
+                None,
+                route_runtime,
+                None,
+                ip_tracker,
+                beobachten,
+                false,
+                real_peer_report,
+            )
+            .run()
+            .await
+        })
+    };
+
+    let mut client = TcpStream::connect(front_addr).await.unwrap();
+    client.write_all(&client_hello).await.unwrap();
+
+    let mut record_header = [0u8; 5];
+    client.read_exact(&mut record_header).await.unwrap();
+    assert_eq!(record_header[0], 0x16, "Valid max-length ClientHello must be accepted");
+
+    drop(client);
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), server_task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let no_mask_connect = tokio::time::timeout(Duration::from_millis(250), mask_listener.accept()).await;
+    assert!(
+        no_mask_connect.is_err(),
+        "Valid max-length ClientHello must not trigger mask fallback in ClientHandler path"
+    );
+
+    assert_eq!(
+        bad_before,
+        stats.get_connects_bad(),
+        "Valid max-length ClientHello must not increment bad counter"
     );
 }

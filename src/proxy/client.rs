@@ -151,8 +151,13 @@ where
         if is_tls {
             let tls_len = u16::from_be_bytes([first_bytes[3], first_bytes[4]]) as usize;
 
-            if tls_len < 512 {
-                debug!(peer = %real_peer, tls_len = tls_len, "TLS handshake too short");
+// RFC 8446 §5.1 mandates that TLSPlaintext records must not exceed 2^14
+        // bytes (16_384). A client claiming a larger record is non-compliant and
+        // may be an active probe attempting to force large allocations.
+        //
+        // Also enforce a minimum record size to avoid trivial/garbage probes.
+        if !(512..=MAX_TLS_RECORD_SIZE).contains(&tls_len) {
+                debug!(peer = %real_peer, tls_len = tls_len, max_tls_len = MAX_TLS_RECORD_SIZE, "TLS handshake length out of bounds");
                 stats.increment_connects_bad();
                 let (reader, writer) = tokio::io::split(stream);
                 handle_bad_client(
@@ -525,8 +530,10 @@ impl RunningClientHandler {
 
         debug!(peer = %peer, tls_len = tls_len, "Reading TLS handshake");
 
-        if tls_len < 512 {
-            debug!(peer = %peer, tls_len = tls_len, "TLS handshake too short");
+        // See RFC 8446 §5.1: TLSPlaintext records must not exceed 16_384 bytes.
+        // Treat too-small or too-large lengths as active probes and mask them.
+        if !(512..=MAX_TLS_RECORD_SIZE).contains(&tls_len) {
+            debug!(peer = %peer, tls_len = tls_len, max_tls_len = MAX_TLS_RECORD_SIZE, "TLS handshake length out of bounds");
             self.stats.increment_connects_bad();
             let (reader, writer) = self.stream.into_split();
             handle_bad_client(

@@ -21,6 +21,28 @@ use crate::tls_front::{TlsFrontCache, emulator};
 
 const ACCESS_SECRET_BYTES: usize = 16;
 
+// Decide whether a client-supplied proto tag is allowed given the configured
+// proxy modes and the transport that carried the handshake.
+//
+// A common mistake is to treat `modes.tls` and `modes.secure` as interchangeable
+// even though they correspond to different transport profiles: `modes.tls` is
+// for the TLS-fronted (EE-TLS) path, while `modes.secure` is for direct MTProto
+// over TCP (DD). Enforcing this separation prevents an attacker from using a
+// TLS-capable client to bypass the operator intent for the direct MTProto mode,
+// and vice versa.
+fn mode_enabled_for_proto(config: &ProxyConfig, proto_tag: ProtoTag, is_tls: bool) -> bool {
+    match proto_tag {
+        ProtoTag::Secure => {
+            if is_tls {
+                config.general.modes.tls
+            } else {
+                config.general.modes.secure
+            }
+        }
+        ProtoTag::Intermediate | ProtoTag::Abridged => config.general.modes.classic,
+    }
+}
+
 fn decode_user_secrets(
     config: &ProxyConfig,
     preferred_user: Option<&str>,
@@ -292,16 +314,7 @@ where
             None => continue,
         };
 
-        let mode_ok = match proto_tag {
-            ProtoTag::Secure => {
-                if is_tls {
-                    config.general.modes.tls || config.general.modes.secure
-                } else {
-                    config.general.modes.secure || config.general.modes.tls
-                }
-            }
-            ProtoTag::Intermediate | ProtoTag::Abridged => config.general.modes.classic,
-        };
+        let mode_ok = mode_enabled_for_proto(config, proto_tag, is_tls);
 
         if !mode_ok {
             debug!(peer = %peer, user = %user, proto = ?proto_tag, "Mode not enabled");
@@ -324,8 +337,12 @@ where
 
         let encryptor = AesCtr::new(&enc_key, enc_iv);
 
-        // Apply replay tracking only after successful authentication to prevent
-        // unauthenticated probes from evicting legitimate replay-cache entries.
+// Apply replay tracking only after successful authentication.
+    //
+    // This ordering prevents an attacker from producing invalid handshakes that
+    // still collide with a valid handshake's replay slot and thus evict a valid
+    // entry from the cache. We accept the cost of performing the full
+    // authentication check first to avoid poisoning the replay cache.
         if replay_checker.check_and_add_handshake(dec_prekey_iv) {
             warn!(peer = %peer, user = %user, "MTProto replay attack detected");
             return HandshakeResult::BadClient { reader, writer };
