@@ -54,6 +54,7 @@ pub struct HotFields {
     pub me_reinit_coalesce_window_ms: u64,
     pub hardswap:                bool,
     pub me_pool_drain_ttl_secs:  u64,
+    pub me_instadrain: bool,
     pub me_pool_drain_threshold: u64,
     pub me_pool_min_fresh_ratio: f32,
     pub me_reinit_drain_timeout_secs: u64,
@@ -136,6 +137,7 @@ impl HotFields {
             me_reinit_coalesce_window_ms: cfg.general.me_reinit_coalesce_window_ms,
             hardswap:                cfg.general.hardswap,
             me_pool_drain_ttl_secs:  cfg.general.me_pool_drain_ttl_secs,
+            me_instadrain: cfg.general.me_instadrain,
             me_pool_drain_threshold: cfg.general.me_pool_drain_threshold,
             me_pool_min_fresh_ratio: cfg.general.me_pool_min_fresh_ratio,
             me_reinit_drain_timeout_secs: cfg.general.me_reinit_drain_timeout_secs,
@@ -431,6 +433,7 @@ fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
     cfg.general.me_reinit_coalesce_window_ms = new.general.me_reinit_coalesce_window_ms;
     cfg.general.hardswap = new.general.hardswap;
     cfg.general.me_pool_drain_ttl_secs = new.general.me_pool_drain_ttl_secs;
+    cfg.general.me_instadrain = new.general.me_instadrain;
     cfg.general.me_pool_drain_threshold = new.general.me_pool_drain_threshold;
     cfg.general.me_pool_min_fresh_ratio = new.general.me_pool_min_fresh_ratio;
     cfg.general.me_reinit_drain_timeout_secs = new.general.me_reinit_drain_timeout_secs;
@@ -803,6 +806,12 @@ fn log_changes(
         info!(
             "config reload: me_pool_drain_ttl_secs: {}s → {}s",
             old_hot.me_pool_drain_ttl_secs, new_hot.me_pool_drain_ttl_secs,
+        );
+    }
+    if old_hot.me_instadrain != new_hot.me_instadrain {
+        info!(
+            "config reload: me_instadrain: {} → {}",
+            old_hot.me_instadrain, new_hot.me_instadrain,
         );
     }
 

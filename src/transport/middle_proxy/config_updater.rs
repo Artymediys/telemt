@@ -298,6 +298,7 @@ async fn run_update_cycle(
     pool.update_runtime_reinit_policy(
         cfg.general.hardswap,
         cfg.general.me_pool_drain_ttl_secs,
+        cfg.general.me_instadrain,
         cfg.general.me_pool_drain_threshold,
         cfg.general.effective_me_pool_force_close_secs(),
         cfg.general.me_pool_min_fresh_ratio,
@@ -525,6 +526,7 @@ pub async fn me_config_updater(
                 pool.update_runtime_reinit_policy(
                     cfg.general.hardswap,
                     cfg.general.me_pool_drain_ttl_secs,
+                    cfg.general.me_instadrain,
                     cfg.general.me_pool_drain_threshold,
                     cfg.general.effective_me_pool_force_close_secs(),
                     cfg.general.me_pool_min_fresh_ratio,

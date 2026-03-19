@@ -28,6 +28,7 @@ const HEALTH_RECONNECT_BUDGET_MAX: usize = 128;
 const HEALTH_DRAIN_CLOSE_BUDGET_PER_CORE: usize = 16;
 const HEALTH_DRAIN_CLOSE_BUDGET_MIN: usize = 16;
 const HEALTH_DRAIN_CLOSE_BUDGET_MAX: usize = 256;
+const HEALTH_DRAIN_TIMEOUT_ENFORCER_INTERVAL_SECS: u64 = 1;
 
 #[derive(Debug, Clone)]
 struct DcFloorPlanEntry {
@@ -111,6 +112,17 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
         )
         .await;
         degraded_interval = v4_degraded || v6_degraded;
+    }
+}
+
+pub async fn me_drain_timeout_enforcer(pool: Arc<MePool>) {
+    let mut drain_warn_next_allowed: HashMap<u64, Instant> = HashMap::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(
+            HEALTH_DRAIN_TIMEOUT_ENFORCER_INTERVAL_SECS,
+        ))
+        .await;
+        reap_draining_writers(&pool, &mut drain_warn_next_allowed).await;
     }
 }
 
@@ -1482,6 +1494,7 @@ mod tests {
             general.me_adaptive_floor_max_warm_writers_global,
             general.hardswap,
             general.me_pool_drain_ttl_secs,
+            general.me_instadrain,
             general.me_pool_drain_threshold,
             general.effective_me_pool_force_close_secs(),
             general.me_pool_min_fresh_ratio,

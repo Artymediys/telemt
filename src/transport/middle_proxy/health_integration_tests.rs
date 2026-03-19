@@ -80,6 +80,7 @@ async fn make_pool(
         general.me_adaptive_floor_max_warm_writers_global,
         general.hardswap,
         general.me_pool_drain_ttl_secs,
+        general.me_instadrain,
         general.me_pool_drain_threshold,
         general.effective_me_pool_force_close_secs(),
         general.me_pool_min_fresh_ratio,
