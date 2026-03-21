@@ -107,7 +107,6 @@ jobs:
           mkdir dist
           find artifacts -name "*.tar.gz" -exec tar -xzf {} -C dist \;
 
-          # используем musl как runtime бинарь
           cp dist/telemt-x86_64-unknown-linux-musl dist/telemt || true
 
       - uses: docker/setup-qemu-action@v3
