@@ -121,6 +121,19 @@ fn auth_probe_eviction_offset(peer_ip: IpAddr, now: Instant) -> usize {
     hasher.finish() as usize
 }
 
+fn auth_probe_scan_start_offset(
+    peer_ip: IpAddr,
+    now: Instant,
+    state_len: usize,
+    scan_limit: usize,
+) -> usize {
+    if state_len == 0 || scan_limit == 0 {
+        return 0;
+    }
+
+    auth_probe_eviction_offset(peer_ip, now) % state_len
+}
+
 fn auth_probe_is_throttled(peer_ip: IpAddr, now: Instant) -> bool {
     let peer_ip = normalize_auth_probe_ip(peer_ip);
     let state = auth_probe_state_map();
@@ -269,11 +282,7 @@ fn auth_probe_record_failure_with_state(
             let mut eviction_candidate: Option<(IpAddr, u32, Instant)> = None;
             let state_len = state.len();
             let scan_limit = state_len.min(AUTH_PROBE_PRUNE_SCAN_LIMIT);
-            let start_offset = if state_len == 0 {
-                0
-            } else {
-                auth_probe_eviction_offset(peer_ip, now) % state_len
-            };
+            let start_offset = auth_probe_scan_start_offset(peer_ip, now, state_len, scan_limit);
 
             let mut scanned = 0usize;
             for entry in state.iter().skip(start_offset) {
@@ -605,16 +614,6 @@ where
         }
     };
 
-    // Replay tracking is applied only after successful authentication to avoid
-    // letting unauthenticated probes evict valid entries from the replay cache.
-    let digest_half = &validation.digest[..tls::TLS_DIGEST_HALF_LEN];
-    if replay_checker.check_and_add_tls_digest(digest_half) {
-        auth_probe_record_failure(peer.ip(), Instant::now());
-        maybe_apply_server_hello_delay(config).await;
-        warn!(peer = %peer, "TLS replay attack detected (duplicate digest)");
-        return HandshakeResult::BadClient { reader, writer };
-    }
-
     let secret = match secrets.iter().find(|(name, _)| *name == validation.user) {
         Some((_, s)) => s,
         None => {
@@ -669,6 +668,16 @@ where
     } else {
         None
     };
+
+    // Replay tracking is applied only after full policy validation (including
+    // ALPN checks) so rejected handshakes cannot poison replay state.
+    let digest_half = &validation.digest[..tls::TLS_DIGEST_HALF_LEN];
+    if replay_checker.check_and_add_tls_digest(digest_half) {
+        auth_probe_record_failure(peer.ip(), Instant::now());
+        maybe_apply_server_hello_delay(config).await;
+        warn!(peer = %peer, "TLS replay attack detected (duplicate digest)");
+        return HandshakeResult::BadClient { reader, writer };
+    }
 
     let response = if let Some((cached_entry, use_full_cert_payload)) = cached {
         emulator::build_emulated_server_hello(
@@ -769,7 +778,7 @@ where
         let mut dec_key_input = Zeroizing::new(Vec::with_capacity(PREKEY_LEN + secret.len()));
         dec_key_input.extend_from_slice(dec_prekey);
         dec_key_input.extend_from_slice(&secret);
-        let dec_key = sha256(&dec_key_input);
+        let dec_key = Zeroizing::new(sha256(&dec_key_input));
 
         let mut dec_iv_arr = [0u8; IV_LEN];
         dec_iv_arr.copy_from_slice(dec_iv_bytes);
@@ -805,7 +814,7 @@ where
         let mut enc_key_input = Zeroizing::new(Vec::with_capacity(PREKEY_LEN + secret.len()));
         enc_key_input.extend_from_slice(enc_prekey);
         enc_key_input.extend_from_slice(&secret);
-        let enc_key = sha256(&enc_key_input);
+        let enc_key = Zeroizing::new(sha256(&enc_key_input));
 
         let mut enc_iv_arr = [0u8; IV_LEN];
         enc_iv_arr.copy_from_slice(enc_iv_bytes);
@@ -830,9 +839,9 @@ where
             user: user.clone(),
             dc_idx,
             proto_tag,
-            dec_key,
+            dec_key: *dec_key,
             dec_iv,
-            enc_key,
+            enc_key: *enc_key,
             enc_iv,
             peer,
             is_tls,
@@ -978,6 +987,38 @@ mod saturation_poison_security_tests;
 #[cfg(test)]
 #[path = "tests/handshake_auth_probe_hardening_adversarial_tests.rs"]
 mod auth_probe_hardening_adversarial_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_auth_probe_scan_budget_security_tests.rs"]
+mod auth_probe_scan_budget_security_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_auth_probe_scan_offset_stress_tests.rs"]
+mod auth_probe_scan_offset_stress_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_auth_probe_eviction_bias_security_tests.rs"]
+mod auth_probe_eviction_bias_security_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_advanced_clever_tests.rs"]
+mod advanced_clever_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_more_clever_tests.rs"]
+mod more_clever_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_real_bug_stress_tests.rs"]
+mod real_bug_stress_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_timing_manual_bench_tests.rs"]
+mod timing_manual_bench_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_key_material_zeroization_security_tests.rs"]
+mod handshake_key_material_zeroization_security_tests;
 
 /// Compile-time guard: HandshakeSuccess holds cryptographic key material and
 /// must never be Copy.  A Copy impl would allow silent key duplication,

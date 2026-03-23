@@ -62,7 +62,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional_with_sizes};
-use tokio::time::Instant;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{Instant, Sleep};
 use tracing::{debug, trace, warn};
 
 // ============= Constants =============
@@ -209,12 +210,16 @@ struct StatsIo<S> {
     counters: Arc<SharedCounters>,
     stats: Arc<Stats>,
     user: String,
+    quota_lock: Option<Arc<Mutex<()>>>,
+    cross_mode_quota_lock: Option<Arc<AsyncMutex<()>>>,
     quota_limit: Option<u64>,
     quota_exceeded: Arc<AtomicBool>,
     quota_read_wake_scheduled: bool,
     quota_write_wake_scheduled: bool,
-    quota_read_retry_active: Arc<AtomicBool>,
-    quota_write_retry_active: Arc<AtomicBool>,
+    quota_read_retry_sleep: Option<Pin<Box<Sleep>>>,
+    quota_write_retry_sleep: Option<Pin<Box<Sleep>>>,
+    quota_read_retry_attempt: u8,
+    quota_write_retry_attempt: u8,
     epoch: Instant,
 }
 
@@ -230,27 +235,26 @@ impl<S> StatsIo<S> {
     ) -> Self {
         // Mark initial activity so the watchdog doesn't fire before data flows
         counters.touch(Instant::now(), epoch);
+        let quota_lock = quota_limit.map(|_| quota_user_lock(&user));
+        let cross_mode_quota_lock = quota_limit
+            .map(|_| crate::proxy::quota_lock_registry::cross_mode_quota_user_lock(&user));
         Self {
             inner,
             counters,
             stats,
             user,
+            quota_lock,
+            cross_mode_quota_lock,
             quota_limit,
             quota_exceeded,
             quota_read_wake_scheduled: false,
             quota_write_wake_scheduled: false,
-            quota_read_retry_active: Arc::new(AtomicBool::new(false)),
-            quota_write_retry_active: Arc::new(AtomicBool::new(false)),
+            quota_read_retry_sleep: None,
+            quota_write_retry_sleep: None,
+            quota_read_retry_attempt: 0,
+            quota_write_retry_attempt: 0,
             epoch,
         }
-    }
-}
-
-impl<S> Drop for StatsIo<S> {
-    fn drop(&mut self) {
-        self.quota_read_retry_active.store(false, Ordering::Relaxed);
-        self.quota_write_retry_active
-            .store(false, Ordering::Relaxed);
     }
 }
 
@@ -281,20 +285,69 @@ fn is_quota_io_error(err: &io::Error) -> bool {
 const QUOTA_CONTENTION_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 #[cfg(not(test))]
 const QUOTA_CONTENTION_RETRY_INTERVAL: Duration = Duration::from_millis(2);
+#[cfg(test)]
+const QUOTA_CONTENTION_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(16);
+#[cfg(not(test))]
+const QUOTA_CONTENTION_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(64);
 
-fn spawn_quota_retry_waker(retry_active: Arc<AtomicBool>, waker: std::task::Waker) {
-    tokio::task::spawn(async move {
-        loop {
-            if !retry_active.load(Ordering::Relaxed) {
-                break;
-            }
-            tokio::time::sleep(QUOTA_CONTENTION_RETRY_INTERVAL).await;
-            if !retry_active.load(Ordering::Relaxed) {
-                break;
-            }
-            waker.wake_by_ref();
-        }
-    });
+#[cfg(test)]
+static QUOTA_RETRY_SLEEP_ALLOCS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static QUOTA_USER_LOCK_EVICTOR_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_quota_retry_sleep_allocs_for_tests() {
+    QUOTA_RETRY_SLEEP_ALLOCS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn quota_retry_sleep_allocs_for_tests() -> u64 {
+    QUOTA_RETRY_SLEEP_ALLOCS.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn quota_contention_retry_delay(retry_attempt: u8) -> Duration {
+    let shift = u32::from(retry_attempt.min(5));
+    let multiplier = 1_u32 << shift;
+    QUOTA_CONTENTION_RETRY_INTERVAL
+        .saturating_mul(multiplier)
+        .min(QUOTA_CONTENTION_RETRY_MAX_INTERVAL)
+}
+
+#[inline]
+fn reset_quota_retry_scheduler(
+    sleep_slot: &mut Option<Pin<Box<Sleep>>>,
+    wake_scheduled: &mut bool,
+    retry_attempt: &mut u8,
+) {
+    *wake_scheduled = false;
+    *sleep_slot = None;
+    *retry_attempt = 0;
+}
+
+fn poll_quota_retry_sleep(
+    sleep_slot: &mut Option<Pin<Box<Sleep>>>,
+    wake_scheduled: &mut bool,
+    retry_attempt: &mut u8,
+    cx: &mut Context<'_>,
+) {
+    if !*wake_scheduled {
+        *wake_scheduled = true;
+        #[cfg(test)]
+        QUOTA_RETRY_SLEEP_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        *sleep_slot = Some(Box::pin(tokio::time::sleep(quota_contention_retry_delay(
+            *retry_attempt,
+        ))));
+    }
+
+    if let Some(sleep) = sleep_slot.as_mut()
+        && sleep.as_mut().poll(cx).is_ready()
+    {
+        *sleep_slot = None;
+        *wake_scheduled = false;
+        *retry_attempt = retry_attempt.saturating_add(1);
+        cx.waker().wake_by_ref();
+    }
 }
 
 static QUOTA_USER_LOCKS: OnceLock<DashMap<String, Arc<Mutex<()>>>> = OnceLock::new();
@@ -333,14 +386,45 @@ fn quota_overflow_user_lock(user: &str) -> Arc<Mutex<()>> {
     Arc::clone(&stripes[hash % stripes.len()])
 }
 
+pub(crate) fn quota_user_lock_evict() {
+    if let Some(locks) = QUOTA_USER_LOCKS.get() {
+        locks.retain(|_, value| Arc::strong_count(value) > 1);
+    }
+}
+
+pub(crate) fn spawn_quota_user_lock_evictor(interval: Duration) -> tokio::task::JoinHandle<()> {
+    let interval = interval.max(Duration::from_millis(1));
+    #[cfg(test)]
+    QUOTA_USER_LOCK_EVICTOR_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            quota_user_lock_evict();
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_quota_user_lock_evictor_for_tests(
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    spawn_quota_user_lock_evictor(interval)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_quota_user_lock_evictor_spawn_count_for_tests() {
+    QUOTA_USER_LOCK_EVICTOR_SPAWN_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn quota_user_lock_evictor_spawn_count_for_tests() -> u64 {
+    QUOTA_USER_LOCK_EVICTOR_SPAWN_COUNT.load(Ordering::Relaxed)
+}
+
 fn quota_user_lock(user: &str) -> Arc<Mutex<()>> {
     let locks = QUOTA_USER_LOCKS.get_or_init(DashMap::new);
     if let Some(existing) = locks.get(user) {
         return Arc::clone(existing.value());
-    }
-
-    if locks.len() >= QUOTA_USER_LOCKS_MAX {
-        locks.retain(|_, value| Arc::strong_count(value) > 1);
     }
 
     if locks.len() >= QUOTA_USER_LOCKS_MAX {
@@ -357,6 +441,11 @@ fn quota_user_lock(user: &str) -> Arc<Mutex<()>> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn cross_mode_quota_user_lock_for_tests(user: &str) -> Arc<AsyncMutex<()>> {
+    crate::proxy::quota_lock_registry::cross_mode_quota_user_lock(user)
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -368,32 +457,45 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
             return Poll::Ready(Err(quota_io_error()));
         }
 
-        let quota_lock = this
-            .quota_limit
-            .is_some()
-            .then(|| quota_user_lock(&this.user));
-        let _quota_guard = if let Some(lock) = quota_lock.as_ref() {
+        let _quota_guard = if let Some(lock) = this.quota_lock.as_ref() {
             match lock.try_lock() {
-                Ok(guard) => {
-                    this.quota_read_wake_scheduled = false;
-                    this.quota_read_retry_active.store(false, Ordering::Relaxed);
-                    Some(guard)
-                }
+                Ok(guard) => Some(guard),
                 Err(_) => {
-                    if !this.quota_read_wake_scheduled {
-                        this.quota_read_wake_scheduled = true;
-                        this.quota_read_retry_active.store(true, Ordering::Relaxed);
-                        spawn_quota_retry_waker(
-                            Arc::clone(&this.quota_read_retry_active),
-                            cx.waker().clone(),
-                        );
-                    }
+                    poll_quota_retry_sleep(
+                        &mut this.quota_read_retry_sleep,
+                        &mut this.quota_read_wake_scheduled,
+                        &mut this.quota_read_retry_attempt,
+                        cx,
+                    );
                     return Poll::Pending;
                 }
             }
         } else {
             None
         };
+
+        let _cross_mode_quota_guard = if let Some(lock) = this.cross_mode_quota_lock.as_ref() {
+            match lock.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    poll_quota_retry_sleep(
+                        &mut this.quota_read_retry_sleep,
+                        &mut this.quota_read_wake_scheduled,
+                        &mut this.quota_read_retry_attempt,
+                        cx,
+                    );
+                    return Poll::Pending;
+                }
+            }
+        } else {
+            None
+        };
+
+        reset_quota_retry_scheduler(
+            &mut this.quota_read_retry_sleep,
+            &mut this.quota_read_wake_scheduled,
+            &mut this.quota_read_retry_attempt,
+        );
 
         if let Some(limit) = this.quota_limit
             && this.stats.get_user_total_octets(&this.user) >= limit
@@ -460,33 +562,45 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
             return Poll::Ready(Err(quota_io_error()));
         }
 
-        let quota_lock = this
-            .quota_limit
-            .is_some()
-            .then(|| quota_user_lock(&this.user));
-        let _quota_guard = if let Some(lock) = quota_lock.as_ref() {
+        let _quota_guard = if let Some(lock) = this.quota_lock.as_ref() {
             match lock.try_lock() {
-                Ok(guard) => {
-                    this.quota_write_wake_scheduled = false;
-                    this.quota_write_retry_active
-                        .store(false, Ordering::Relaxed);
-                    Some(guard)
-                }
+                Ok(guard) => Some(guard),
                 Err(_) => {
-                    if !this.quota_write_wake_scheduled {
-                        this.quota_write_wake_scheduled = true;
-                        this.quota_write_retry_active.store(true, Ordering::Relaxed);
-                        spawn_quota_retry_waker(
-                            Arc::clone(&this.quota_write_retry_active),
-                            cx.waker().clone(),
-                        );
-                    }
+                    poll_quota_retry_sleep(
+                        &mut this.quota_write_retry_sleep,
+                        &mut this.quota_write_wake_scheduled,
+                        &mut this.quota_write_retry_attempt,
+                        cx,
+                    );
                     return Poll::Pending;
                 }
             }
         } else {
             None
         };
+
+        let _cross_mode_quota_guard = if let Some(lock) = this.cross_mode_quota_lock.as_ref() {
+            match lock.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    poll_quota_retry_sleep(
+                        &mut this.quota_write_retry_sleep,
+                        &mut this.quota_write_wake_scheduled,
+                        &mut this.quota_write_retry_attempt,
+                        cx,
+                    );
+                    return Poll::Pending;
+                }
+            }
+        } else {
+            None
+        };
+
+        reset_quota_retry_scheduler(
+            &mut this.quota_write_retry_sleep,
+            &mut this.quota_write_wake_scheduled,
+            &mut this.quota_write_retry_attempt,
+        );
 
         let write_buf = if let Some(limit) = this.quota_limit {
             let used = this.stats.get_user_total_octets(&this.user);
@@ -781,6 +895,10 @@ mod relay_quota_model_adversarial_tests;
 mod relay_quota_overflow_regression_tests;
 
 #[cfg(test)]
+#[path = "tests/relay_quota_extended_attack_surface_security_tests.rs"]
+mod relay_quota_extended_attack_surface_security_tests;
+
+#[cfg(test)]
 #[path = "tests/relay_watchdog_delta_security_tests.rs"]
 mod relay_watchdog_delta_security_tests;
 
@@ -791,3 +909,63 @@ mod relay_quota_waker_storm_adversarial_tests;
 #[cfg(test)]
 #[path = "tests/relay_quota_wake_liveness_regression_tests.rs"]
 mod relay_quota_wake_liveness_regression_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_quota_lock_identity_security_tests.rs"]
+mod relay_quota_lock_identity_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_cross_mode_quota_lock_security_tests.rs"]
+mod relay_cross_mode_quota_lock_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_quota_retry_scheduler_tdd_tests.rs"]
+mod relay_quota_retry_scheduler_tdd_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_cross_mode_quota_fairness_tdd_tests.rs"]
+mod relay_cross_mode_quota_fairness_tdd_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_cross_mode_pipeline_hol_integration_security_tests.rs"]
+mod relay_cross_mode_pipeline_hol_integration_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_cross_mode_pipeline_latency_benchmark_security_tests.rs"]
+mod relay_cross_mode_pipeline_latency_benchmark_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_quota_retry_backoff_security_tests.rs"]
+mod relay_quota_retry_backoff_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_quota_retry_backoff_benchmark_security_tests.rs"]
+mod relay_quota_retry_backoff_benchmark_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_dual_lock_backoff_regression_security_tests.rs"]
+mod relay_dual_lock_backoff_regression_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_dual_lock_contention_matrix_security_tests.rs"]
+mod relay_dual_lock_contention_matrix_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_dual_lock_race_harness_security_tests.rs"]
+mod relay_dual_lock_race_harness_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_dual_lock_alternating_contention_security_tests.rs"]
+mod relay_dual_lock_alternating_contention_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_quota_retry_allocation_latency_security_tests.rs"]
+mod relay_quota_retry_allocation_latency_security_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_quota_lock_eviction_lifecycle_tdd_tests.rs"]
+mod relay_quota_lock_eviction_lifecycle_tdd_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_quota_lock_eviction_stress_security_tests.rs"]
+mod relay_quota_lock_eviction_stress_security_tests;

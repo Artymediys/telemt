@@ -1,5 +1,7 @@
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
+use std::future::Future;
 use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,10 +41,14 @@ const C2ME_CHANNEL_CAPACITY_FALLBACK: usize = 128;
 const C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS: usize = 64;
 const C2ME_SENDER_FAIRNESS_BUDGET: usize = 32;
 const RELAY_IDLE_IO_POLL_MAX: Duration = Duration::from_secs(1);
+const TINY_FRAME_DEBT_PER_TINY: u32 = 8;
+const TINY_FRAME_DEBT_LIMIT: u32 = 512;
 #[cfg(test)]
 const C2ME_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const C2ME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const RELAY_TEST_STEP_TIMEOUT: Duration = Duration::from_secs(1);
 const ME_D2C_FLUSH_BATCH_MAX_FRAMES_MIN: usize = 1;
 const ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN: usize = 4096;
 const ME_D2C_FRAME_BUF_SHRINK_HYSTERESIS_FACTOR: usize = 2;
@@ -94,10 +100,23 @@ fn relay_idle_candidate_registry() -> &'static Mutex<RelayIdleCandidateRegistry>
     RELAY_IDLE_CANDIDATE_REGISTRY.get_or_init(|| Mutex::new(RelayIdleCandidateRegistry::default()))
 }
 
+fn relay_idle_candidate_registry_lock() -> std::sync::MutexGuard<'static, RelayIdleCandidateRegistry> {
+    let registry = relay_idle_candidate_registry();
+    match registry.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            // Fail closed after panic while holding registry lock: drop all
+            // candidates and pressure cursors to avoid stale cross-session state.
+            *guard = RelayIdleCandidateRegistry::default();
+            registry.clear_poison();
+            guard
+        }
+    }
+}
+
 fn mark_relay_idle_candidate(conn_id: u64) -> bool {
-    let Ok(mut guard) = relay_idle_candidate_registry().lock() else {
-        return false;
-    };
+    let mut guard = relay_idle_candidate_registry_lock();
 
     if guard.by_conn_id.contains_key(&conn_id) {
         return false;
@@ -116,9 +135,7 @@ fn mark_relay_idle_candidate(conn_id: u64) -> bool {
 }
 
 fn clear_relay_idle_candidate(conn_id: u64) {
-    let Ok(mut guard) = relay_idle_candidate_registry().lock() else {
-        return;
-    };
+    let mut guard = relay_idle_candidate_registry_lock();
 
     if let Some(meta) = guard.by_conn_id.remove(&conn_id) {
         guard.ordered.remove(&(meta.mark_order_seq, conn_id));
@@ -127,23 +144,17 @@ fn clear_relay_idle_candidate(conn_id: u64) {
 
 #[cfg(test)]
 fn oldest_relay_idle_candidate() -> Option<u64> {
-    let Ok(guard) = relay_idle_candidate_registry().lock() else {
-        return None;
-    };
+    let guard = relay_idle_candidate_registry_lock();
     guard.ordered.iter().next().map(|(_, conn_id)| *conn_id)
 }
 
 fn note_relay_pressure_event() {
-    let Ok(mut guard) = relay_idle_candidate_registry().lock() else {
-        return;
-    };
+    let mut guard = relay_idle_candidate_registry_lock();
     guard.pressure_event_seq = guard.pressure_event_seq.wrapping_add(1);
 }
 
 fn relay_pressure_event_seq() -> u64 {
-    let Ok(guard) = relay_idle_candidate_registry().lock() else {
-        return 0;
-    };
+    let guard = relay_idle_candidate_registry_lock();
     guard.pressure_event_seq
 }
 
@@ -152,9 +163,7 @@ fn maybe_evict_idle_candidate_on_pressure(
     seen_pressure_seq: &mut u64,
     stats: &Stats,
 ) -> bool {
-    let Ok(mut guard) = relay_idle_candidate_registry().lock() else {
-        return false;
-    };
+    let mut guard = relay_idle_candidate_registry_lock();
 
     let latest_pressure_seq = guard.pressure_event_seq;
     if latest_pressure_seq == *seen_pressure_seq {
@@ -199,13 +208,9 @@ fn maybe_evict_idle_candidate_on_pressure(
 
 #[cfg(test)]
 fn clear_relay_idle_pressure_state_for_testing() {
-    if let Some(registry) = RELAY_IDLE_CANDIDATE_REGISTRY.get()
-        && let Ok(mut guard) = registry.lock()
-    {
-        guard.by_conn_id.clear();
-        guard.ordered.clear();
-        guard.pressure_event_seq = 0;
-        guard.pressure_consumed_seq = 0;
+    if RELAY_IDLE_CANDIDATE_REGISTRY.get().is_some() {
+        let mut guard = relay_idle_candidate_registry_lock();
+        *guard = RelayIdleCandidateRegistry::default();
     }
     RELAY_IDLE_MARK_SEQ.store(0, Ordering::Relaxed);
 }
@@ -259,6 +264,7 @@ impl RelayClientIdlePolicy {
 struct RelayClientIdleState {
     last_client_frame_at: Instant,
     soft_idle_marked: bool,
+    tiny_frame_debt: u32,
 }
 
 impl RelayClientIdleState {
@@ -266,6 +272,7 @@ impl RelayClientIdleState {
         Self {
             last_client_frame_at: now,
             soft_idle_marked: false,
+            tiny_frame_debt: 0,
         }
     }
 
@@ -552,15 +559,6 @@ fn quota_soft_cap(limit: u64, overshoot: u64) -> u64 {
     limit.saturating_add(overshoot)
 }
 
-fn quota_exceeded_for_user_soft(
-    stats: &Stats,
-    user: &str,
-    quota_limit: Option<u64>,
-    overshoot: u64,
-) -> bool {
-    quota_limit.is_some_and(|quota| stats.get_user_total_octets(user) >= quota_soft_cap(quota, overshoot))
-}
-
 fn quota_would_be_exceeded_for_user_soft(
     stats: &Stats,
     user: &str,
@@ -568,11 +566,8 @@ fn quota_would_be_exceeded_for_user_soft(
     bytes: u64,
     overshoot: u64,
 ) -> bool {
-    quota_limit.is_some_and(|quota| {
-        let cap = quota_soft_cap(quota, overshoot);
-        let used = stats.get_user_total_octets(user);
-        used >= cap || bytes > cap.saturating_sub(used)
-    })
+    let capped_limit = quota_limit.map(|quota| quota_soft_cap(quota, overshoot));
+    quota_would_be_exceeded_for_user(stats, user, capped_limit, bytes)
 }
 
 fn classify_me_d2c_flush_reason(
@@ -618,6 +613,16 @@ fn observe_me_d2c_flush_event(
     }
 }
 
+fn rollback_me2c_quota_reservation(
+    stats: &Stats,
+    user: &str,
+    bytes_me2c: &AtomicU64,
+    reserved_bytes: u64,
+) {
+    stats.sub_user_octets_to(user, reserved_bytes);
+    bytes_me2c.fetch_sub(reserved_bytes, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 fn quota_user_lock_test_guard() -> &'static Mutex<()> {
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -627,6 +632,19 @@ fn quota_user_lock_test_guard() -> &'static Mutex<()> {
 #[cfg(test)]
 fn quota_user_lock_test_scope() -> std::sync::MutexGuard<'static, ()> {
     quota_user_lock_test_guard()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+fn relay_idle_pressure_test_guard() -> &'static Mutex<()> {
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+pub(crate) fn relay_idle_pressure_test_scope() -> std::sync::MutexGuard<'static, ()> {
+    relay_idle_pressure_test_guard()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -666,6 +684,11 @@ fn quota_user_lock(user: &str) -> Arc<AsyncMutex<()>> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn cross_mode_quota_user_lock_for_tests(user: &str) -> Arc<AsyncMutex<()>> {
+    crate::proxy::quota_lock_registry::cross_mode_quota_user_lock(user)
+}
+
 async fn enqueue_c2me_command(
     tx: &mpsc::Sender<C2MeCommand>,
     cmd: C2MeCommand,
@@ -691,6 +714,16 @@ async fn enqueue_c2me_command(
     }
 }
 
+#[cfg(test)]
+async fn run_relay_test_step_timeout<F, T>(context: &'static str, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    timeout(RELAY_TEST_STEP_TIMEOUT, fut)
+        .await
+        .unwrap_or_else(|_| panic!("{context} exceeded {}s", RELAY_TEST_STEP_TIMEOUT.as_secs()))
+}
+
 pub(crate) async fn handle_via_middle_proxy<R, W>(
     mut crypto_reader: CryptoReader<R>,
     crypto_writer: CryptoWriter<W>,
@@ -711,6 +744,8 @@ where
 {
     let user = success.user.clone();
     let quota_limit = config.access.user_data_quota.get(&user).copied();
+    let cross_mode_quota_lock =
+        quota_limit.map(|_| crate::proxy::quota_lock_registry::cross_mode_quota_user_lock(&user));
     let peer = success.peer;
     let proto_tag = success.proto_tag;
     let pool_generation = me_pool.current_generation();
@@ -837,6 +872,7 @@ where
     let stats_clone = stats.clone();
     let rng_clone = rng.clone();
     let user_clone = user.clone();
+    let cross_mode_quota_lock_me_writer = cross_mode_quota_lock.clone();
     let last_downstream_activity_ms_clone = last_downstream_activity_ms.clone();
     let bytes_me2c_clone = bytes_me2c.clone();
     let d2c_flush_policy = MeD2cFlushPolicy::from_config(&config);
@@ -858,7 +894,7 @@ where
 
                     let first_is_downstream_activity =
                         matches!(&first, MeResponse::Data { .. } | MeResponse::Ack(_));
-                    match process_me_writer_response(
+                    match process_me_writer_response_with_cross_mode_lock(
                         first,
                         &mut writer,
                         proto_tag,
@@ -868,6 +904,7 @@ where
                         &user_clone,
                         quota_limit,
                         d2c_flush_policy.quota_soft_overshoot_bytes,
+                        cross_mode_quota_lock_me_writer.as_ref(),
                         bytes_me2c_clone.as_ref(),
                         conn_id,
                         d2c_flush_policy.ack_flush_immediate,
@@ -916,7 +953,7 @@ where
 
                         let next_is_downstream_activity =
                             matches!(&next, MeResponse::Data { .. } | MeResponse::Ack(_));
-                        match process_me_writer_response(
+                        match process_me_writer_response_with_cross_mode_lock(
                             next,
                             &mut writer,
                             proto_tag,
@@ -926,6 +963,7 @@ where
                             &user_clone,
                             quota_limit,
                             d2c_flush_policy.quota_soft_overshoot_bytes,
+                            cross_mode_quota_lock_me_writer.as_ref(),
                             bytes_me2c_clone.as_ref(),
                             conn_id,
                             d2c_flush_policy.ack_flush_immediate,
@@ -977,7 +1015,7 @@ where
                             Ok(Some(next)) => {
                                 let next_is_downstream_activity =
                                     matches!(&next, MeResponse::Data { .. } | MeResponse::Ack(_));
-                                match process_me_writer_response(
+                                match process_me_writer_response_with_cross_mode_lock(
                                     next,
                                     &mut writer,
                                     proto_tag,
@@ -987,6 +1025,7 @@ where
                                     &user_clone,
                                     quota_limit,
                                     d2c_flush_policy.quota_soft_overshoot_bytes,
+                                    cross_mode_quota_lock_me_writer.as_ref(),
                                     bytes_me2c_clone.as_ref(),
                                     conn_id,
                                     d2c_flush_policy.ack_flush_immediate,
@@ -1040,7 +1079,7 @@ where
 
                                     let extra_is_downstream_activity =
                                         matches!(&extra, MeResponse::Data { .. } | MeResponse::Ack(_));
-                                    match process_me_writer_response(
+                                    match process_me_writer_response_with_cross_mode_lock(
                                         extra,
                                         &mut writer,
                                         proto_tag,
@@ -1050,6 +1089,7 @@ where
                                         &user_clone,
                                         quota_limit,
                                         d2c_flush_policy.quota_soft_overshoot_bytes,
+                                        cross_mode_quota_lock_me_writer.as_ref(),
                                         bytes_me2c_clone.as_ref(),
                                         conn_id,
                                         d2c_flush_policy.ack_flush_immediate,
@@ -1222,6 +1262,14 @@ where
                         if let Some(limit) = quota_limit {
                             let quota_lock = quota_user_lock(&user);
                             let _quota_guard = quota_lock.lock().await;
+                            let Some(cross_mode_lock) = cross_mode_quota_lock.as_ref() else {
+                                main_result = Err(ProxyError::Proxy(
+                                    "cross-mode quota lock missing for quota-limited session"
+                                        .to_string(),
+                                ));
+                                break;
+                            };
+                            let _cross_mode_quota_guard = cross_mode_lock.lock().await;
                             stats.add_user_octets_from(&user, payload.len() as u64);
                             if quota_exceeded_for_user(stats.as_ref(), &user, Some(limit)) {
                                 main_result = Err(ProxyError::DataQuotaExceeded {
@@ -1321,6 +1369,8 @@ async fn read_client_payload_with_idle_policy<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
+    const LEGACY_MAX_CONSECUTIVE_ZERO_LEN_FRAMES: u32 = 4;
+
     async fn read_exact_with_policy<R>(
         client_reader: &mut CryptoReader<R>,
         buf: &mut [u8],
@@ -1459,6 +1509,7 @@ where
         Ok(())
     }
 
+    let mut consecutive_zero_len_frames = 0u32;
     loop {
         let (len, quickack, raw_len_bytes) = match proto_tag {
             ProtoTag::Abridged => {
@@ -1539,6 +1590,27 @@ where
         };
 
         if len == 0 {
+            idle_state.tiny_frame_debt = idle_state
+                .tiny_frame_debt
+                .saturating_add(TINY_FRAME_DEBT_PER_TINY);
+            if idle_state.tiny_frame_debt >= TINY_FRAME_DEBT_LIMIT {
+                stats.increment_relay_protocol_desync_close_total();
+                return Err(ProxyError::Proxy(format!(
+                    "Tiny frame overhead limit exceeded: debt={}, conn_id={}",
+                    idle_state.tiny_frame_debt, forensics.conn_id
+                )));
+            }
+
+            if !idle_policy.enabled {
+                consecutive_zero_len_frames =
+                    consecutive_zero_len_frames.saturating_add(1);
+                if consecutive_zero_len_frames > LEGACY_MAX_CONSECUTIVE_ZERO_LEN_FRAMES {
+                    stats.increment_relay_protocol_desync_close_total();
+                    return Err(ProxyError::Proxy(
+                        "Excessive zero-length abridged frames".to_string(),
+                    ));
+                }
+            }
             continue;
         }
         if len < 4 && proto_tag != ProtoTag::Abridged {
@@ -1607,6 +1679,7 @@ where
         }
         *frame_counter += 1;
         idle_state.on_client_frame(Instant::now());
+        idle_state.tiny_frame_debt = idle_state.tiny_frame_debt.saturating_sub(1);
         clear_relay_idle_candidate(forensics.conn_id);
         return Ok(Some((payload, quickack)));
     }
@@ -1682,6 +1755,7 @@ enum MeWriterResponseOutcome {
     Close,
 }
 
+#[cfg(test)]
 async fn process_me_writer_response<W>(
     response: MeResponse,
     client_writer: &mut CryptoWriter<W>,
@@ -1700,6 +1774,44 @@ async fn process_me_writer_response<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    process_me_writer_response_with_cross_mode_lock(
+        response,
+        client_writer,
+        proto_tag,
+        rng,
+        frame_buf,
+        stats,
+        user,
+        quota_limit,
+        quota_soft_overshoot_bytes,
+        None,
+        bytes_me2c,
+        conn_id,
+        ack_flush_immediate,
+        batched,
+    )
+    .await
+}
+
+async fn process_me_writer_response_with_cross_mode_lock<W>(
+    response: MeResponse,
+    client_writer: &mut CryptoWriter<W>,
+    proto_tag: ProtoTag,
+    rng: &SecureRandom,
+    frame_buf: &mut Vec<u8>,
+    stats: &Stats,
+    user: &str,
+    quota_limit: Option<u64>,
+    quota_soft_overshoot_bytes: u64,
+    cross_mode_quota_lock: Option<&Arc<AsyncMutex<()>>>,
+    bytes_me2c: &AtomicU64,
+    conn_id: u64,
+    ack_flush_immediate: bool,
+    batched: bool,
+) -> Result<MeWriterResponseOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     match response {
         MeResponse::Data { flags, data } => {
             if batched {
@@ -1708,39 +1820,76 @@ where
                 trace!(conn_id, bytes = data.len(), flags, "ME->C data");
             }
             let data_len = data.len() as u64;
-            if quota_would_be_exceeded_for_user_soft(
-                stats,
-                user,
-                quota_limit,
-                data_len,
-                quota_soft_overshoot_bytes,
-            ) {
-                stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
-                return Err(ProxyError::DataQuotaExceeded {
-                    user: user.to_string(),
-                });
-            }
+            if let Some(limit) = quota_limit {
+                let owned_cross_mode_lock;
+                let cross_mode_lock = if let Some(lock) = cross_mode_quota_lock {
+                    lock
+                } else {
+                    owned_cross_mode_lock =
+                        crate::proxy::quota_lock_registry::cross_mode_quota_user_lock(user);
+                    &owned_cross_mode_lock
+                };
+                let cross_mode_quota_guard = cross_mode_lock.lock().await;
+                let soft_limit = quota_soft_cap(limit, quota_soft_overshoot_bytes);
+                if quota_would_be_exceeded_for_user_soft(
+                    stats,
+                    user,
+                    Some(limit),
+                    data_len,
+                    quota_soft_overshoot_bytes,
+                ) {
+                    stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
+                    return Err(ProxyError::DataQuotaExceeded {
+                        user: user.to_string(),
+                    });
+                }
 
-            let write_mode =
-                write_client_payload(client_writer, proto_tag, flags, &data, rng, frame_buf)
-                    .await?;
-            stats.increment_me_d2c_write_mode(write_mode);
+                // Reserve quota before awaiting network I/O to avoid same-user HoL stalls.
+                // If reservation loses a race or write fails, we roll back immediately.
+                bytes_me2c.fetch_add(data_len, Ordering::Relaxed);
+                stats.add_user_octets_to(user, data_len);
 
-            bytes_me2c.fetch_add(data.len() as u64, Ordering::Relaxed);
-            stats.add_user_octets_to(user, data.len() as u64);
-            stats.increment_me_d2c_data_frames_total();
-            stats.add_me_d2c_payload_bytes_total(data.len() as u64);
+                if stats.get_user_total_octets(user) > soft_limit {
+                    rollback_me2c_quota_reservation(stats, user, bytes_me2c, data_len);
+                    stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
+                    return Err(ProxyError::DataQuotaExceeded {
+                        user: user.to_string(),
+                    });
+                }
 
-            if quota_exceeded_for_user_soft(
-                stats,
-                user,
-                quota_limit,
-                quota_soft_overshoot_bytes,
-            ) {
-                stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PostWrite);
-                return Err(ProxyError::DataQuotaExceeded {
-                    user: user.to_string(),
-                });
+                // Keep cross-mode lock scope explicit and minimal: quota reservation is serialized,
+                // but socket I/O proceeds without holding same-user cross-mode admission lock.
+                drop(cross_mode_quota_guard);
+
+                let write_mode =
+                    match write_client_payload(client_writer, proto_tag, flags, &data, rng, frame_buf)
+                        .await
+                    {
+                        Ok(mode) => mode,
+                        Err(err) => {
+                            rollback_me2c_quota_reservation(stats, user, bytes_me2c, data_len);
+                            return Err(err);
+                        }
+                    };
+
+                stats.increment_me_d2c_data_frames_total();
+                stats.add_me_d2c_payload_bytes_total(data_len);
+                stats.increment_me_d2c_write_mode(write_mode);
+
+                // Do not fail immediately on exact boundary after a successful write.
+                // Returning an error here can bypass batch flush in the caller and risk
+                // dropping buffered ciphertext from CryptoWriter. The next frame is
+                // rejected by the pre-check at function entry.
+            } else {
+                let write_mode =
+                    write_client_payload(client_writer, proto_tag, flags, &data, rng, frame_buf)
+                        .await?;
+
+                bytes_me2c.fetch_add(data_len, Ordering::Relaxed);
+                stats.add_user_octets_to(user, data_len);
+                stats.increment_me_d2c_data_frames_total();
+                stats.add_me_d2c_payload_bytes_total(data_len);
+                stats.increment_me_d2c_write_mode(write_mode);
             }
 
             Ok(MeWriterResponseOutcome::Continue {
@@ -1979,3 +2128,55 @@ mod length_cast_hardening_security_tests;
 #[cfg(test)]
 #[path = "tests/middle_relay_blackhat_campaign_integration_tests.rs"]
 mod blackhat_campaign_integration_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_hol_quota_security_tests.rs"]
+mod hol_quota_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_quota_reservation_adversarial_tests.rs"]
+mod quota_reservation_adversarial_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_idle_registry_poison_security_tests.rs"]
+mod middle_relay_idle_registry_poison_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_zero_length_frame_security_tests.rs"]
+mod middle_relay_zero_length_frame_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_tiny_frame_debt_security_tests.rs"]
+mod middle_relay_tiny_frame_debt_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_tiny_frame_debt_concurrency_security_tests.rs"]
+mod middle_relay_tiny_frame_debt_concurrency_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_tiny_frame_debt_proto_chunking_security_tests.rs"]
+mod middle_relay_tiny_frame_debt_proto_chunking_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_cross_mode_quota_reservation_security_tests.rs"]
+mod middle_relay_cross_mode_quota_reservation_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_cross_mode_quota_lock_matrix_security_tests.rs"]
+mod middle_relay_cross_mode_quota_lock_matrix_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_cross_mode_lookup_efficiency_security_tests.rs"]
+mod middle_relay_cross_mode_lookup_efficiency_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_cross_mode_lock_release_regression_security_tests.rs"]
+mod middle_relay_cross_mode_lock_release_regression_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_quota_extended_attack_surface_security_tests.rs"]
+mod middle_relay_quota_extended_attack_surface_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_quota_reservation_extreme_security_tests.rs"]
+mod middle_relay_quota_reservation_extreme_security_tests;
