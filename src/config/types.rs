@@ -1367,6 +1367,82 @@ pub enum UnknownSniAction {
     Mask,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsFetchProfile {
+    ModernChromeLike,
+    ModernFirefoxLike,
+    CompatTls12,
+    LegacyMinimal,
+}
+
+impl TlsFetchProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TlsFetchProfile::ModernChromeLike => "modern_chrome_like",
+            TlsFetchProfile::ModernFirefoxLike => "modern_firefox_like",
+            TlsFetchProfile::CompatTls12 => "compat_tls12",
+            TlsFetchProfile::LegacyMinimal => "legacy_minimal",
+        }
+    }
+}
+
+fn default_tls_fetch_profiles() -> Vec<TlsFetchProfile> {
+    vec![
+        TlsFetchProfile::ModernChromeLike,
+        TlsFetchProfile::ModernFirefoxLike,
+        TlsFetchProfile::CompatTls12,
+        TlsFetchProfile::LegacyMinimal,
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsFetchConfig {
+    /// Ordered list of ClientHello profiles used for adaptive fallback.
+    #[serde(default = "default_tls_fetch_profiles")]
+    pub profiles: Vec<TlsFetchProfile>,
+
+    /// When true and upstream route is configured, TLS fetch fails closed on
+    /// upstream connect errors and does not fallback to direct TCP.
+    #[serde(default = "default_tls_fetch_strict_route")]
+    pub strict_route: bool,
+
+    /// Timeout per one profile attempt in milliseconds.
+    #[serde(default = "default_tls_fetch_attempt_timeout_ms")]
+    pub attempt_timeout_ms: u64,
+
+    /// Total wall-clock budget in milliseconds across all profile attempts.
+    #[serde(default = "default_tls_fetch_total_budget_ms")]
+    pub total_budget_ms: u64,
+
+    /// Adds GREASE-style values into selected ClientHello extensions.
+    #[serde(default)]
+    pub grease_enabled: bool,
+
+    /// Produces deterministic ClientHello randomness for debugging/tests.
+    #[serde(default)]
+    pub deterministic: bool,
+
+    /// TTL for winner-profile cache entries in seconds.
+    /// Set to 0 to disable profile cache.
+    #[serde(default = "default_tls_fetch_profile_cache_ttl_secs")]
+    pub profile_cache_ttl_secs: u64,
+}
+
+impl Default for TlsFetchConfig {
+    fn default() -> Self {
+        Self {
+            profiles: default_tls_fetch_profiles(),
+            strict_route: default_tls_fetch_strict_route(),
+            attempt_timeout_ms: default_tls_fetch_attempt_timeout_ms(),
+            total_budget_ms: default_tls_fetch_total_budget_ms(),
+            grease_enabled: false,
+            deterministic: false,
+            profile_cache_ttl_secs: default_tls_fetch_profile_cache_ttl_secs(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AntiCensorshipConfig {
     #[serde(default = "default_tls_domain")]
@@ -1384,6 +1460,10 @@ pub struct AntiCensorshipConfig {
     /// Empty value keeps default upstream routing behavior.
     #[serde(default = "default_tls_fetch_scope")]
     pub tls_fetch_scope: String,
+
+    /// Fetch strategy for TLS front metadata bootstrap and periodic refresh.
+    #[serde(default)]
+    pub tls_fetch: TlsFetchConfig,
 
     #[serde(default = "default_true")]
     pub mask: bool,
@@ -1492,6 +1572,7 @@ impl Default for AntiCensorshipConfig {
             tls_domains: Vec::new(),
             unknown_sni_action: UnknownSniAction::Drop,
             tls_fetch_scope: default_tls_fetch_scope(),
+            tls_fetch: TlsFetchConfig::default(),
             mask: default_true(),
             mask_host: None,
             mask_port: default_mask_port(),
