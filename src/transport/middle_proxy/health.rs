@@ -530,7 +530,7 @@ async fn check_family(
 
         let now = Instant::now();
         if reconnect_sem.available_permits() == 0 {
-            let base_ms = pool.me_reconnect_backoff_base.as_millis() as u64;
+            let base_ms = pool.reconnect_runtime.me_reconnect_backoff_base.as_millis() as u64;
             let next_ms = (*backoff.get(&key).unwrap_or(&base_ms)).max(base_ms);
             let jitter = next_ms / JITTER_FRAC_NUM;
             let wait = Duration::from_millis(next_ms)
@@ -553,7 +553,10 @@ async fn check_family(
             continue;
         }
 
-        let max_concurrent = pool.me_reconnect_max_concurrent_per_dc.max(1) as usize;
+        let max_concurrent = pool
+            .reconnect_runtime
+            .me_reconnect_max_concurrent_per_dc
+            .max(1) as usize;
         if *inflight.get(&key).unwrap_or(&0) >= max_concurrent {
             continue;
         }
@@ -610,7 +613,7 @@ async fn check_family(
                 break;
             }
             let res = tokio::time::timeout(
-                pool.me_one_timeout,
+                pool.reconnect_runtime.me_one_timeout,
                 pool.connect_endpoints_round_robin(dc, &endpoints, rng.as_ref()),
             )
             .await;
@@ -641,17 +644,21 @@ async fn check_family(
                 endpoint_count = endpoints.len(),
                 "ME writer floor restored for DC"
             );
-            backoff.insert(key, pool.me_reconnect_backoff_base.as_millis() as u64);
-            let jitter = pool.me_reconnect_backoff_base.as_millis() as u64 / JITTER_FRAC_NUM;
-            let wait = pool.me_reconnect_backoff_base
+            backoff.insert(
+                key,
+                pool.reconnect_runtime.me_reconnect_backoff_base.as_millis() as u64,
+            );
+            let jitter = pool.reconnect_runtime.me_reconnect_backoff_base.as_millis() as u64
+                / JITTER_FRAC_NUM;
+            let wait = pool.reconnect_runtime.me_reconnect_backoff_base
                 + Duration::from_millis(rand::rng().random_range(0..=jitter.max(1)));
             next_attempt.insert(key, now + wait);
         } else {
             let curr = *backoff
                 .get(&key)
-                .unwrap_or(&(pool.me_reconnect_backoff_base.as_millis() as u64));
-            let next_ms =
-                (curr.saturating_mul(2)).min(pool.me_reconnect_backoff_cap.as_millis() as u64);
+                .unwrap_or(&(pool.reconnect_runtime.me_reconnect_backoff_base.as_millis() as u64));
+            let next_ms = (curr.saturating_mul(2))
+                .min(pool.reconnect_runtime.me_reconnect_backoff_cap.as_millis() as u64);
             backoff.insert(key, next_ms);
             let jitter = next_ms / JITTER_FRAC_NUM;
             let wait = Duration::from_millis(next_ms)
@@ -723,6 +730,7 @@ fn adaptive_floor_class_min(
 ) -> usize {
     if endpoint_count <= 1 {
         let min_single = (pool
+            .floor_runtime
             .me_adaptive_floor_min_writers_single_endpoint
             .load(std::sync::atomic::Ordering::Relaxed) as usize)
             .max(1);
@@ -979,7 +987,7 @@ async fn maybe_swap_idle_writer_for_cap(
     };
 
     let connected = match tokio::time::timeout(
-        pool.me_one_timeout,
+        pool.reconnect_runtime.me_one_timeout,
         pool.connect_one_for_dc(endpoint, dc, rng.as_ref()),
     )
     .await
@@ -1085,7 +1093,7 @@ async fn maybe_refresh_idle_writer_for_dc(
     };
 
     let rotate_ok = match tokio::time::timeout(
-        pool.me_one_timeout,
+        pool.reconnect_runtime.me_one_timeout,
         pool.connect_one_for_dc(endpoint, dc, rng.as_ref()),
     )
     .await
@@ -1236,7 +1244,7 @@ async fn recover_single_endpoint_outage(
         pool.stats
             .increment_me_single_endpoint_quarantine_bypass_total();
         match tokio::time::timeout(
-            pool.me_one_timeout,
+            pool.reconnect_runtime.me_one_timeout,
             pool.connect_one_for_dc(endpoint, key.0, rng.as_ref()),
         )
         .await
@@ -1265,7 +1273,7 @@ async fn recover_single_endpoint_outage(
     } else {
         let one_endpoint = [endpoint];
         match tokio::time::timeout(
-            pool.me_one_timeout,
+            pool.reconnect_runtime.me_one_timeout,
             pool.connect_endpoints_round_robin(key.0, &one_endpoint, rng.as_ref()),
         )
         .await
@@ -1390,7 +1398,7 @@ async fn maybe_rotate_single_endpoint_shadow(
     };
 
     let rotate_ok = match tokio::time::timeout(
-        pool.me_one_timeout,
+        pool.reconnect_runtime.me_one_timeout,
         pool.connect_one_for_dc(endpoint, dc, rng.as_ref()),
     )
     .await

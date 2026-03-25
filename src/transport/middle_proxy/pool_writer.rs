@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -97,7 +97,8 @@ async fn ping_loop(
         let effective_jitter_ms = keepalive_jitter.as_millis().min(jitter_cap_ms).max(1);
         Duration::from_millis(rand::rng().random_range(0..=effective_jitter_ms as u64))
     } else {
-        let jitter = rand::rng().random_range(-ME_ACTIVE_PING_JITTER_SECS..=ME_ACTIVE_PING_JITTER_SECS);
+        let jitter =
+            rand::rng().random_range(-ME_ACTIVE_PING_JITTER_SECS..=ME_ACTIVE_PING_JITTER_SECS);
         let wait = (ME_ACTIVE_PING_SECS as i64 + jitter).max(5) as u64;
         Duration::from_secs(wait)
     };
@@ -116,9 +117,11 @@ async fn ping_loop(
             }
             let jitter_cap_ms = interval.as_millis() / 2;
             let effective_jitter_ms = keepalive_jitter.as_millis().min(jitter_cap_ms).max(1);
-            interval + Duration::from_millis(rand::rng().random_range(0..=effective_jitter_ms as u64))
+            interval
+                + Duration::from_millis(rand::rng().random_range(0..=effective_jitter_ms as u64))
         } else {
-            let jitter = rand::rng().random_range(-ME_ACTIVE_PING_JITTER_SECS..=ME_ACTIVE_PING_JITTER_SECS);
+            let jitter =
+                rand::rng().random_range(-ME_ACTIVE_PING_JITTER_SECS..=ME_ACTIVE_PING_JITTER_SECS);
             let secs = (ME_ACTIVE_PING_SECS as i64 + jitter).max(5) as u64;
             Duration::from_secs(secs)
         };
@@ -193,7 +196,8 @@ async fn rpc_proxy_req_signal_loop(
                 .as_millis()
                 .min(jitter_cap_ms)
                 .max(1);
-            interval + Duration::from_millis(rand::rng().random_range(0..=effective_jitter_ms as u64))
+            interval
+                + Duration::from_millis(rand::rng().random_range(0..=effective_jitter_ms as u64))
         };
 
         tokio::select! {
@@ -365,9 +369,8 @@ impl MePool {
         let draining_started_at_epoch_secs = Arc::new(AtomicU64::new(0));
         let drain_deadline_epoch_secs = Arc::new(AtomicU64::new(0));
         let allow_drain_fallback = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel::<WriterCommand>(
-            self.writer_lifecycle.writer_cmd_channel_capacity,
-        );
+        let (tx, rx) =
+            mpsc::channel::<WriterCommand>(self.writer_lifecycle.writer_cmd_channel_capacity);
         let rpc_writer = RpcWriter {
             writer: hs.wr,
             key: hs.write_key,
@@ -430,7 +433,7 @@ impl MePool {
         let cancel_signal = cancel.clone();
         let cancel_select = cancel.clone();
         let cancel_cleanup = cancel.clone();
-        let reader_route_data_wait_ms = self.me_reader_route_data_wait_ms.clone();
+        let reader_route_data_wait_ms = self.transport_policy.me_reader_route_data_wait_ms.clone();
 
         tokio::spawn(async move {
             // Reader MUST be the first branch in biased select! to avoid read starvation.

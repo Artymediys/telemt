@@ -37,7 +37,9 @@ impl MePool {
     }
 
     fn clear_pending_hardswap_state(&self) {
-        self.reinit.pending_hardswap_generation.store(0, Ordering::Relaxed);
+        self.reinit
+            .pending_hardswap_generation
+            .store(0, Ordering::Relaxed);
         self.reinit
             .pending_hardswap_started_at_epoch_secs
             .store(0, Ordering::Relaxed);
@@ -213,7 +215,8 @@ impl MePool {
             .reinit
             .me_hardswap_warmup_pass_backoff_base_ms
             .load(Ordering::Relaxed);
-        let cap_ms = (self.me_reconnect_backoff_cap.as_millis() as u64).max(base_ms);
+        let cap_ms =
+            (self.reconnect_runtime.me_reconnect_backoff_cap.as_millis() as u64).max(base_ms);
         let shift = (pass_idx as u32).min(20);
         let scaled = base_ms.saturating_mul(1u64 << shift);
         let core = scaled.min(cap_ms);
@@ -392,7 +395,10 @@ impl MePool {
                 .reinit
                 .pending_hardswap_started_at_epoch_secs
                 .load(Ordering::Relaxed);
-            let pending_map_hash = self.reinit.pending_hardswap_map_hash.load(Ordering::Relaxed);
+            let pending_map_hash = self
+                .reinit
+                .pending_hardswap_map_hash
+                .load(Ordering::Relaxed);
             let pending_age_secs = now_epoch_secs.saturating_sub(pending_started_at);
             let pending_ttl_expired =
                 pending_started_at > 0 && pending_age_secs > ME_HARDSWAP_PENDING_TTL_SECS;
@@ -443,7 +449,9 @@ impl MePool {
         };
 
         if hardswap {
-            self.reinit.warm_generation.store(generation, Ordering::Relaxed);
+            self.reinit
+                .warm_generation
+                .store(generation, Ordering::Relaxed);
             self.warmup_generation_for_all_dcs(rng, generation, &desired_by_dc)
                 .await;
         } else {

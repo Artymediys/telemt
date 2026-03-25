@@ -162,7 +162,8 @@ impl ConnRegistry {
         inner.routing.map.remove(&id);
         inner.binding.meta.remove(&id);
         if let Some(writer_id) = inner.binding.writer_for_conn.remove(&id) {
-            let became_empty = if let Some(set) = inner.binding.conns_for_writer.get_mut(&writer_id) {
+            let became_empty = if let Some(set) = inner.binding.conns_for_writer.get_mut(&writer_id)
+            {
                 set.remove(&id);
                 set.is_empty()
             } else {
@@ -337,7 +338,10 @@ impl ConnRegistry {
 
         inner.binding.meta.insert(conn_id, meta.clone());
         inner.binding.last_meta_for_writer.insert(writer_id, meta);
-        inner.binding.writer_idle_since_epoch_secs.remove(&writer_id);
+        inner
+            .binding
+            .writer_idle_since_epoch_secs
+            .remove(&writer_id);
         inner
             .binding
             .conns_for_writer
@@ -375,7 +379,12 @@ impl ConnRegistry {
         let inner = self.inner.read().await;
         let mut out = HashMap::<u64, u64>::with_capacity(writer_ids.len());
         for writer_id in writer_ids {
-            if let Some(idle_since) = inner.binding.writer_idle_since_epoch_secs.get(writer_id).copied() {
+            if let Some(idle_since) = inner
+                .binding
+                .writer_idle_since_epoch_secs
+                .get(writer_id)
+                .copied()
+            {
                 out.insert(*writer_id, idle_since);
             }
         }
@@ -456,7 +465,10 @@ impl ConnRegistry {
         let mut inner = self.inner.write().await;
         inner.binding.writers.remove(&writer_id);
         inner.binding.last_meta_for_writer.remove(&writer_id);
-        inner.binding.writer_idle_since_epoch_secs.remove(&writer_id);
+        inner
+            .binding
+            .writer_idle_since_epoch_secs
+            .remove(&writer_id);
         let conns = inner
             .binding
             .conns_for_writer
@@ -510,7 +522,10 @@ impl ConnRegistry {
 
         inner.binding.writers.remove(&writer_id);
         inner.binding.last_meta_for_writer.remove(&writer_id);
-        inner.binding.writer_idle_since_epoch_secs.remove(&writer_id);
+        inner
+            .binding
+            .writer_idle_since_epoch_secs
+            .remove(&writer_id);
         inner.binding.conns_for_writer.remove(&writer_id);
         true
     }

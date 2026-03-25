@@ -219,7 +219,7 @@ impl MePool {
     }
 
     async fn refill_writer_after_loss(self: &Arc<Self>, addr: SocketAddr, writer_dc: i32) -> bool {
-        let fast_retries = self.me_reconnect_fast_retry_count.max(1);
+        let fast_retries = self.reconnect_runtime.me_reconnect_fast_retry_count.max(1);
         let mut total_attempts = 0u32;
         let same_endpoint_quarantined = self.is_endpoint_quarantined(addr).await;
 

@@ -339,6 +339,7 @@ impl MePool {
         let mut fresh_alive_writers = 0usize;
         let floor_mode = self.floor_mode();
         let adaptive_cpu_cores = (self
+            .floor_runtime
             .me_adaptive_floor_cpu_cores_effective
             .load(Ordering::Relaxed) as usize)
             .max(1);
@@ -353,22 +354,26 @@ impl MePool {
                 self.required_writers_for_dc_with_floor_mode(endpoint_count, false);
             let floor_min = if endpoint_count <= 1 {
                 (self
+                    .floor_runtime
                     .me_adaptive_floor_min_writers_single_endpoint
                     .load(Ordering::Relaxed) as usize)
                     .max(1)
                     .min(base_required.max(1))
             } else {
                 (self
+                    .floor_runtime
                     .me_adaptive_floor_min_writers_multi_endpoint
                     .load(Ordering::Relaxed) as usize)
                     .max(1)
                     .min(base_required.max(1))
             };
             let extra_per_core = if endpoint_count <= 1 {
-                self.me_adaptive_floor_max_extra_writers_single_per_core
+                self.floor_runtime
+                    .me_adaptive_floor_max_extra_writers_single_per_core
                     .load(Ordering::Relaxed) as usize
             } else {
-                self.me_adaptive_floor_max_extra_writers_multi_per_core
+                self.floor_runtime
+                    .me_adaptive_floor_max_extra_writers_multi_per_core
                     .load(Ordering::Relaxed) as usize
             };
             let floor_max =
@@ -490,75 +495,100 @@ impl MePool {
             pending_hardswap_age_secs,
             hardswap_enabled: self.reinit.hardswap.load(Ordering::Relaxed),
             floor_mode: floor_mode_label(self.floor_mode()),
-            adaptive_floor_idle_secs: self.me_adaptive_floor_idle_secs.load(Ordering::Relaxed),
+            adaptive_floor_idle_secs: self
+                .floor_runtime
+                .me_adaptive_floor_idle_secs
+                .load(Ordering::Relaxed),
             adaptive_floor_min_writers_single_endpoint: self
+                .floor_runtime
                 .me_adaptive_floor_min_writers_single_endpoint
                 .load(Ordering::Relaxed),
             adaptive_floor_min_writers_multi_endpoint: self
+                .floor_runtime
                 .me_adaptive_floor_min_writers_multi_endpoint
                 .load(Ordering::Relaxed),
             adaptive_floor_recover_grace_secs: self
+                .floor_runtime
                 .me_adaptive_floor_recover_grace_secs
                 .load(Ordering::Relaxed),
             adaptive_floor_writers_per_core_total: self
+                .floor_runtime
                 .me_adaptive_floor_writers_per_core_total
                 .load(Ordering::Relaxed) as u16,
             adaptive_floor_cpu_cores_override: self
+                .floor_runtime
                 .me_adaptive_floor_cpu_cores_override
                 .load(Ordering::Relaxed) as u16,
             adaptive_floor_max_extra_writers_single_per_core: self
+                .floor_runtime
                 .me_adaptive_floor_max_extra_writers_single_per_core
                 .load(Ordering::Relaxed)
                 as u16,
             adaptive_floor_max_extra_writers_multi_per_core: self
+                .floor_runtime
                 .me_adaptive_floor_max_extra_writers_multi_per_core
                 .load(Ordering::Relaxed)
                 as u16,
             adaptive_floor_max_active_writers_per_core: self
+                .floor_runtime
                 .me_adaptive_floor_max_active_writers_per_core
                 .load(Ordering::Relaxed)
                 as u16,
             adaptive_floor_max_warm_writers_per_core: self
+                .floor_runtime
                 .me_adaptive_floor_max_warm_writers_per_core
                 .load(Ordering::Relaxed)
                 as u16,
             adaptive_floor_max_active_writers_global: self
+                .floor_runtime
                 .me_adaptive_floor_max_active_writers_global
                 .load(Ordering::Relaxed),
             adaptive_floor_max_warm_writers_global: self
+                .floor_runtime
                 .me_adaptive_floor_max_warm_writers_global
                 .load(Ordering::Relaxed),
             adaptive_floor_cpu_cores_detected: self
+                .floor_runtime
                 .me_adaptive_floor_cpu_cores_detected
                 .load(Ordering::Relaxed),
             adaptive_floor_cpu_cores_effective: self
+                .floor_runtime
                 .me_adaptive_floor_cpu_cores_effective
                 .load(Ordering::Relaxed),
             adaptive_floor_global_cap_raw: self
+                .floor_runtime
                 .me_adaptive_floor_global_cap_raw
                 .load(Ordering::Relaxed),
             adaptive_floor_global_cap_effective: self
+                .floor_runtime
                 .me_adaptive_floor_global_cap_effective
                 .load(Ordering::Relaxed),
             adaptive_floor_target_writers_total: self
+                .floor_runtime
                 .me_adaptive_floor_target_writers_total
                 .load(Ordering::Relaxed),
             adaptive_floor_active_cap_configured: self
+                .floor_runtime
                 .me_adaptive_floor_active_cap_configured
                 .load(Ordering::Relaxed),
             adaptive_floor_active_cap_effective: self
+                .floor_runtime
                 .me_adaptive_floor_active_cap_effective
                 .load(Ordering::Relaxed),
             adaptive_floor_warm_cap_configured: self
+                .floor_runtime
                 .me_adaptive_floor_warm_cap_configured
                 .load(Ordering::Relaxed),
             adaptive_floor_warm_cap_effective: self
+                .floor_runtime
                 .me_adaptive_floor_warm_cap_effective
                 .load(Ordering::Relaxed),
             adaptive_floor_active_writers_current: self
+                .floor_runtime
                 .me_adaptive_floor_active_writers_current
                 .load(Ordering::Relaxed),
             adaptive_floor_warm_writers_current: self
+                .floor_runtime
                 .me_adaptive_floor_warm_writers_current
                 .load(Ordering::Relaxed),
             me_keepalive_enabled: self.writer_lifecycle.me_keepalive_enabled,
@@ -569,10 +599,16 @@ impl MePool {
                 .writer_lifecycle
                 .rpc_proxy_req_every_secs
                 .load(Ordering::Relaxed),
-            me_reconnect_max_concurrent_per_dc: self.me_reconnect_max_concurrent_per_dc,
-            me_reconnect_backoff_base_ms: self.me_reconnect_backoff_base.as_millis() as u64,
-            me_reconnect_backoff_cap_ms: self.me_reconnect_backoff_cap.as_millis() as u64,
-            me_reconnect_fast_retry_count: self.me_reconnect_fast_retry_count,
+            me_reconnect_max_concurrent_per_dc: self
+                .reconnect_runtime
+                .me_reconnect_max_concurrent_per_dc,
+            me_reconnect_backoff_base_ms: self
+                .reconnect_runtime
+                .me_reconnect_backoff_base
+                .as_millis() as u64,
+            me_reconnect_backoff_cap_ms: self.reconnect_runtime.me_reconnect_backoff_cap.as_millis()
+                as u64,
+            me_reconnect_fast_retry_count: self.reconnect_runtime.me_reconnect_fast_retry_count,
             me_pool_drain_ttl_secs: self
                 .drain_runtime
                 .me_pool_drain_ttl_secs
@@ -615,7 +651,10 @@ impl MePool {
                 .single_endpoint_runtime
                 .me_single_endpoint_shadow_rotate_every_secs
                 .load(Ordering::Relaxed),
-            me_deterministic_writer_sort: self.me_deterministic_writer_sort.load(Ordering::Relaxed),
+            me_deterministic_writer_sort: self
+                .writer_selection_policy
+                .me_deterministic_writer_sort
+                .load(Ordering::Relaxed),
             me_writer_pick_mode: writer_pick_mode_label(self.writer_pick_mode()),
             me_writer_pick_sample_size: self.writer_pick_sample_size() as u8,
             me_socks_kdf_policy: socks_kdf_policy_label(self.socks_kdf_policy()),

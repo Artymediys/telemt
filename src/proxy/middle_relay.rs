@@ -323,8 +323,8 @@ fn should_emit_full_desync(key: u64, all_full: bool, now: Instant) -> bool {
 
     let dedup_current = DESYNC_DEDUP.get_or_init(DashMap::new);
     let dedup_previous = DESYNC_DEDUP_PREVIOUS.get_or_init(DashMap::new);
-    let rotation_state = DESYNC_DEDUP_ROTATION_STATE
-        .get_or_init(|| Mutex::new(DesyncDedupRotationState::default()));
+    let rotation_state =
+        DESYNC_DEDUP_ROTATION_STATE.get_or_init(|| Mutex::new(DesyncDedupRotationState::default()));
 
     let mut state = match rotation_state.lock() {
         Ok(guard) => guard,

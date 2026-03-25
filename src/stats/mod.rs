@@ -1206,8 +1206,7 @@ impl Stats {
     }
     pub fn increment_me_hybrid_timeout_total(&self) {
         if self.telemetry_me_allows_normal() {
-            self.me_hybrid_timeout_total
-                .fetch_add(1, Ordering::Relaxed);
+            self.me_hybrid_timeout_total.fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn increment_me_async_recovery_trigger_total(&self) {
