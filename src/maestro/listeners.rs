@@ -262,6 +262,7 @@ pub(crate) async fn bind_listeners(
                                     break;
                                 }
                                 Err(_) => {
+                                    stats.increment_accept_permit_timeout_total();
                                     debug!(
                                         timeout_ms = accept_permit_timeout_ms,
                                         "Dropping accepted unix connection: permit wait timeout"
@@ -407,6 +408,7 @@ pub(crate) fn spawn_tcp_accept_loops(
                                     break;
                                 }
                                 Err(_) => {
+                                    stats.increment_accept_permit_timeout_total();
                                     debug!(
                                         peer = %peer_addr,
                                         timeout_ms = accept_permit_timeout_ms,

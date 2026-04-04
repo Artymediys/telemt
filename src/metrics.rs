@@ -361,6 +361,134 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
 
     let _ = writeln!(
         out,
+        "# HELP telemt_accept_permit_timeout_total Accepted connections dropped due to permit wait timeout"
+    );
+    let _ = writeln!(out, "# TYPE telemt_accept_permit_timeout_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_accept_permit_timeout_total {}",
+        if core_enabled {
+            stats.get_accept_permit_timeout_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_conntrack_control_state Runtime conntrack control state flags"
+    );
+    let _ = writeln!(out, "# TYPE telemt_conntrack_control_state gauge");
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_control_state{{flag=\"enabled\"}} {}",
+        if stats.get_conntrack_control_enabled() {
+            1
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_control_state{{flag=\"available\"}} {}",
+        if stats.get_conntrack_control_available() {
+            1
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_control_state{{flag=\"pressure_active\"}} {}",
+        if stats.get_conntrack_pressure_active() {
+            1
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_control_state{{flag=\"rule_apply_ok\"}} {}",
+        if stats.get_conntrack_rule_apply_ok() {
+            1
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_conntrack_event_queue_depth Pending close events in conntrack control queue"
+    );
+    let _ = writeln!(out, "# TYPE telemt_conntrack_event_queue_depth gauge");
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_event_queue_depth {}",
+        stats.get_conntrack_event_queue_depth()
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_conntrack_delete_total Conntrack delete attempts by outcome"
+    );
+    let _ = writeln!(out, "# TYPE telemt_conntrack_delete_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_delete_total{{result=\"attempt\"}} {}",
+        if core_enabled {
+            stats.get_conntrack_delete_attempt_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_delete_total{{result=\"success\"}} {}",
+        if core_enabled {
+            stats.get_conntrack_delete_success_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_delete_total{{result=\"not_found\"}} {}",
+        if core_enabled {
+            stats.get_conntrack_delete_not_found_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_delete_total{{result=\"error\"}} {}",
+        if core_enabled {
+            stats.get_conntrack_delete_error_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_conntrack_close_event_drop_total Dropped conntrack close events due to queue pressure or unavailable sender"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_conntrack_close_event_drop_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_conntrack_close_event_drop_total {}",
+        if core_enabled {
+            stats.get_conntrack_close_event_drop_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_upstream_connect_attempt_total Upstream connect attempts across all requests"
     );
     let _ = writeln!(out, "# TYPE telemt_upstream_connect_attempt_total counter");

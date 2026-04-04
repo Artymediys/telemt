@@ -91,6 +91,17 @@ pub struct Stats {
     current_connections_direct: AtomicU64,
     current_connections_me: AtomicU64,
     handshake_timeouts: AtomicU64,
+    accept_permit_timeout_total: AtomicU64,
+    conntrack_control_enabled_gauge: AtomicBool,
+    conntrack_control_available_gauge: AtomicBool,
+    conntrack_pressure_active_gauge: AtomicBool,
+    conntrack_event_queue_depth_gauge: AtomicU64,
+    conntrack_rule_apply_ok_gauge: AtomicBool,
+    conntrack_delete_attempt_total: AtomicU64,
+    conntrack_delete_success_total: AtomicU64,
+    conntrack_delete_not_found_total: AtomicU64,
+    conntrack_delete_error_total: AtomicU64,
+    conntrack_close_event_drop_total: AtomicU64,
     upstream_connect_attempt_total: AtomicU64,
     upstream_connect_success_total: AtomicU64,
     upstream_connect_fail_total: AtomicU64,
@@ -528,6 +539,74 @@ impl Stats {
             self.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    pub fn increment_accept_permit_timeout_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.accept_permit_timeout_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_conntrack_control_enabled(&self, enabled: bool) {
+        self.conntrack_control_enabled_gauge
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_conntrack_control_available(&self, available: bool) {
+        self.conntrack_control_available_gauge
+            .store(available, Ordering::Relaxed);
+    }
+
+    pub fn set_conntrack_pressure_active(&self, active: bool) {
+        self.conntrack_pressure_active_gauge
+            .store(active, Ordering::Relaxed);
+    }
+
+    pub fn set_conntrack_event_queue_depth(&self, depth: u64) {
+        self.conntrack_event_queue_depth_gauge
+            .store(depth, Ordering::Relaxed);
+    }
+
+    pub fn set_conntrack_rule_apply_ok(&self, ok: bool) {
+        self.conntrack_rule_apply_ok_gauge
+            .store(ok, Ordering::Relaxed);
+    }
+
+    pub fn increment_conntrack_delete_attempt_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.conntrack_delete_attempt_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_conntrack_delete_success_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.conntrack_delete_success_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_conntrack_delete_not_found_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.conntrack_delete_not_found_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_conntrack_delete_error_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.conntrack_delete_error_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_conntrack_close_event_drop_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.conntrack_close_event_drop_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn increment_upstream_connect_attempt_total(&self) {
         if self.telemetry_core_enabled() {
             self.upstream_connect_attempt_total
@@ -1477,6 +1556,9 @@ impl Stats {
     pub fn get_connects_bad(&self) -> u64 {
         self.connects_bad.load(Ordering::Relaxed)
     }
+    pub fn get_accept_permit_timeout_total(&self) -> u64 {
+        self.accept_permit_timeout_total.load(Ordering::Relaxed)
+    }
     pub fn get_current_connections_direct(&self) -> u64 {
         self.current_connections_direct.load(Ordering::Relaxed)
     }
@@ -1486,6 +1568,38 @@ impl Stats {
     pub fn get_current_connections_total(&self) -> u64 {
         self.get_current_connections_direct()
             .saturating_add(self.get_current_connections_me())
+    }
+    pub fn get_conntrack_control_enabled(&self) -> bool {
+        self.conntrack_control_enabled_gauge.load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_control_available(&self) -> bool {
+        self.conntrack_control_available_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_pressure_active(&self) -> bool {
+        self.conntrack_pressure_active_gauge.load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_event_queue_depth(&self) -> u64 {
+        self.conntrack_event_queue_depth_gauge
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_rule_apply_ok(&self) -> bool {
+        self.conntrack_rule_apply_ok_gauge.load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_delete_attempt_total(&self) -> u64 {
+        self.conntrack_delete_attempt_total.load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_delete_success_total(&self) -> u64 {
+        self.conntrack_delete_success_total.load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_delete_not_found_total(&self) -> u64 {
+        self.conntrack_delete_not_found_total.load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_delete_error_total(&self) -> u64 {
+        self.conntrack_delete_error_total.load(Ordering::Relaxed)
+    }
+    pub fn get_conntrack_close_event_drop_total(&self) -> u64 {
+        self.conntrack_close_event_drop_total.load(Ordering::Relaxed)
     }
     pub fn get_me_keepalive_sent(&self) -> u64 {
         self.me_keepalive_sent.load(Ordering::Relaxed)

@@ -2,6 +2,7 @@
 
 mod api;
 mod cli;
+mod conntrack_control;
 mod config;
 mod crypto;
 #[cfg(unix)]

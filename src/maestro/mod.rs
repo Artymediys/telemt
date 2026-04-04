@@ -28,6 +28,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 
 use crate::api;
+use crate::conntrack_control;
 use crate::config::{LogLevel, ProxyConfig};
 use crate::crypto::SecureRandom;
 use crate::ip_tracker::UserIpTracker;
@@ -633,6 +634,11 @@ async fn run_inner(
     .await;
     let _admission_tx_hold = admission_tx;
     let shared_state = ProxySharedState::new();
+    conntrack_control::spawn_conntrack_controller(
+        config_rx.clone(),
+        stats.clone(),
+        shared_state.clone(),
+    );
 
     let bound = listeners::bind_listeners(
         &config,

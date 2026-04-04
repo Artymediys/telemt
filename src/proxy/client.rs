@@ -80,7 +80,7 @@ use crate::transport::middle_proxy::MePool;
 use crate::transport::socket::normalize_ip;
 use crate::transport::{UpstreamManager, configure_client_socket, parse_proxy_protocol};
 
-use crate::proxy::direct_relay::handle_via_direct;
+use crate::proxy::direct_relay::handle_via_direct_with_shared;
 use crate::proxy::handshake::{
     HandshakeSuccess, handle_mtproto_handshake_with_shared, handle_tls_handshake_with_shared,
 };
@@ -188,6 +188,24 @@ fn handshake_timeout_with_mask_grace(config: &ProxyConfig) -> Duration {
         base.saturating_add(Duration::from_millis(750))
     } else {
         base
+    }
+}
+
+fn effective_client_first_byte_idle_secs(config: &ProxyConfig, shared: &ProxySharedState) -> u64 {
+    let idle_secs = config.timeouts.client_first_byte_idle_secs;
+    if idle_secs == 0 {
+        return 0;
+    }
+    if shared.conntrack_pressure_active() {
+        idle_secs.min(
+            config
+                .server
+                .conntrack_control
+                .profile
+                .client_first_byte_idle_cap_secs(),
+        )
+    } else {
+        idle_secs
     }
 }
 
@@ -463,10 +481,11 @@ where
 
     debug!(peer = %real_peer, "New connection (generic stream)");
 
-    let first_byte = if config.timeouts.client_first_byte_idle_secs == 0 {
+    let first_byte_idle_secs = effective_client_first_byte_idle_secs(&config, shared.as_ref());
+    let first_byte = if first_byte_idle_secs == 0 {
         None
     } else {
-        let idle_timeout = Duration::from_secs(config.timeouts.client_first_byte_idle_secs);
+        let idle_timeout = Duration::from_secs(first_byte_idle_secs);
         let mut first_byte = [0u8; 1];
         match timeout(idle_timeout, stream.read(&mut first_byte)).await {
             Ok(Ok(0)) => {
@@ -499,15 +518,15 @@ where
                 );
                 return Err(ProxyError::Io(e));
             }
-            Err(_) => {
-                debug!(
-                    peer = %real_peer,
-                    idle_secs = config.timeouts.client_first_byte_idle_secs,
-                    "Closing idle pooled connection before first client byte"
-                );
-                return Ok(());
+                Err(_) => {
+                    debug!(
+                        peer = %real_peer,
+                        idle_secs = first_byte_idle_secs,
+                        "Closing idle pooled connection before first client byte"
+                    );
+                    return Ok(());
+                }
             }
-        }
     };
 
     let handshake_timeout = handshake_timeout_with_mask_grace(&config);
@@ -968,11 +987,12 @@ impl RunningClientHandler {
             }
         }
 
-        let first_byte = if self.config.timeouts.client_first_byte_idle_secs == 0 {
+        let first_byte_idle_secs =
+            effective_client_first_byte_idle_secs(&self.config, self.shared.as_ref());
+        let first_byte = if first_byte_idle_secs == 0 {
             None
         } else {
-            let idle_timeout =
-                Duration::from_secs(self.config.timeouts.client_first_byte_idle_secs);
+            let idle_timeout = Duration::from_secs(first_byte_idle_secs);
             let mut first_byte = [0u8; 1];
             match timeout(idle_timeout, self.stream.read(&mut first_byte)).await {
                 Ok(Ok(0)) => {
@@ -1008,7 +1028,7 @@ impl RunningClientHandler {
                 Err(_) => {
                     debug!(
                         peer = %self.peer,
-                        idle_secs = self.config.timeouts.client_first_byte_idle_secs,
+                        idle_secs = first_byte_idle_secs,
                         "Closing idle pooled connection before first client byte"
                     );
                     return Ok(None);
@@ -1395,7 +1415,7 @@ impl RunningClientHandler {
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
         ip_tracker: Arc<UserIpTracker>,
-        _shared: Arc<ProxySharedState>,
+        shared: Arc<ProxySharedState>,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -1438,12 +1458,12 @@ impl RunningClientHandler {
                     route_runtime.subscribe(),
                     route_snapshot,
                     session_id,
-                    _shared,
+                    shared.clone(),
                 )
                 .await
             } else {
                 warn!("use_middle_proxy=true but MePool not initialized, falling back to direct");
-                handle_via_direct(
+                handle_via_direct_with_shared(
                     client_reader,
                     client_writer,
                     success,
@@ -1455,12 +1475,14 @@ impl RunningClientHandler {
                     route_runtime.subscribe(),
                     route_snapshot,
                     session_id,
+                    local_addr,
+                    shared.clone(),
                 )
                 .await
             }
         } else {
             // Direct mode (original behavior)
-            handle_via_direct(
+            handle_via_direct_with_shared(
                 client_reader,
                 client_writer,
                 success,
@@ -1472,6 +1494,8 @@ impl RunningClientHandler {
                 route_runtime.subscribe(),
                 route_snapshot,
                 session_id,
+                local_addr,
+                shared.clone(),
             )
             .await
         };

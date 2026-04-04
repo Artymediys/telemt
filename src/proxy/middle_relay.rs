@@ -16,12 +16,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
-use crate::config::ProxyConfig;
+use crate::config::{ConntrackPressureProfile, ProxyConfig};
 use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::{secure_padding_len, *};
 use crate::proxy::handshake::HandshakeSuccess;
-use crate::proxy::shared_state::ProxySharedState;
+use crate::proxy::shared_state::{
+    ConntrackCloseEvent, ConntrackClosePublishResult, ConntrackCloseReason, ProxySharedState,
+};
 use crate::proxy::route_mode::{
     ROUTE_SWITCH_ERROR_MSG, RelayRouteMode, RouteCutoverState, affected_cutover_state,
     cutover_stagger_delay,
@@ -135,6 +137,10 @@ fn note_relay_pressure_event_in(shared: &ProxySharedState) {
     guard.pressure_event_seq = guard.pressure_event_seq.wrapping_add(1);
 }
 
+pub(crate) fn note_global_relay_pressure(shared: &ProxySharedState) {
+    note_relay_pressure_event_in(shared);
+}
+
 fn relay_pressure_event_seq_in(shared: &ProxySharedState) -> u64 {
     let guard = relay_idle_candidate_registry_lock_in(shared);
     guard.pressure_event_seq
@@ -239,6 +245,23 @@ impl RelayClientIdlePolicy {
             hard_idle: frame_read_timeout,
             grace_after_downstream_activity: Duration::ZERO,
             legacy_frame_read_timeout: frame_read_timeout,
+        }
+    }
+
+    fn apply_pressure_caps(&mut self, profile: ConntrackPressureProfile) {
+        let pressure_soft_idle_cap = Duration::from_secs(profile.middle_soft_idle_cap_secs());
+        let pressure_hard_idle_cap = Duration::from_secs(profile.middle_hard_idle_cap_secs());
+
+        self.soft_idle = self.soft_idle.min(pressure_soft_idle_cap);
+        self.hard_idle = self.hard_idle.min(pressure_hard_idle_cap);
+        if self.soft_idle > self.hard_idle {
+            self.soft_idle = self.hard_idle;
+        }
+        self.legacy_frame_read_timeout = self
+            .legacy_frame_read_timeout
+            .min(pressure_hard_idle_cap);
+        if self.grace_after_downstream_activity > self.hard_idle {
+            self.grace_after_downstream_activity = self.hard_idle;
         }
     }
 }
@@ -1027,7 +1050,12 @@ where
     let translated_local_addr = me_pool.translate_our_addr(local_addr);
 
     let frame_limit = config.general.max_client_frame;
-    let relay_idle_policy = RelayClientIdlePolicy::from_config(&config);
+    let mut relay_idle_policy = RelayClientIdlePolicy::from_config(&config);
+    let mut pressure_caps_applied = false;
+    if shared.conntrack_pressure_active() {
+        relay_idle_policy.apply_pressure_caps(config.server.conntrack_control.profile);
+        pressure_caps_applied = true;
+    }
     let session_started_at = forensics.started_at;
     let mut relay_idle_state = RelayClientIdleState::new(session_started_at);
     let last_downstream_activity_ms = Arc::new(AtomicU64::new(0));
@@ -1421,6 +1449,11 @@ where
     let mut route_watch_open = true;
     let mut seen_pressure_seq = relay_pressure_event_seq_in(shared.as_ref());
     loop {
+        if shared.conntrack_pressure_active() && !pressure_caps_applied {
+            relay_idle_policy.apply_pressure_caps(config.server.conntrack_control.profile);
+            pressure_caps_applied = true;
+        }
+
         if relay_idle_policy.enabled
             && maybe_evict_idle_candidate_on_pressure_in(
                 shared.as_ref(),
@@ -1600,6 +1633,20 @@ where
         frames_ok = frame_counter,
         "ME relay cleanup"
     );
+
+    let close_reason = classify_conntrack_close_reason(&result);
+    let publish_result = shared.publish_conntrack_close_event(ConntrackCloseEvent {
+        src: peer,
+        dst: local_addr,
+        reason: close_reason,
+    });
+    if !matches!(
+        publish_result,
+        ConntrackClosePublishResult::Sent | ConntrackClosePublishResult::Disabled
+    ) {
+        stats.increment_conntrack_close_event_drop_total();
+    }
+
     clear_relay_idle_candidate_in(shared.as_ref(), conn_id);
     me_pool.registry().unregister(conn_id).await;
     buffer_pool.trim_to(buffer_pool.max_buffers().min(64));
@@ -1610,6 +1657,33 @@ where
         pool_snapshot.allocated.saturating_sub(pool_snapshot.pooled),
     );
     result
+}
+
+fn classify_conntrack_close_reason(result: &Result<()>) -> ConntrackCloseReason {
+    match result {
+        Ok(()) => ConntrackCloseReason::NormalEof,
+        Err(ProxyError::Io(error)) if matches!(error.kind(), std::io::ErrorKind::TimedOut) => {
+            ConntrackCloseReason::Timeout
+        }
+        Err(ProxyError::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            ConntrackCloseReason::Reset
+        }
+        Err(ProxyError::Proxy(message))
+            if message.contains("pressure") || message.contains("evicted") =>
+        {
+            ConntrackCloseReason::Pressure
+        }
+        Err(_) => ConntrackCloseReason::Other,
+    }
 }
 
 async fn read_client_payload_with_idle_policy_in<R>(
