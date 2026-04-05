@@ -2007,6 +2007,105 @@ This document lists all configuration keys accepted by `config.toml`.
 
 Note: When `server.proxy_protocol` is enabled, incoming PROXY protocol headers are parsed from the first bytes of the connection and the client source address is replaced with `src_addr` from the header. For security, the peer source IP (the direct connection address) is verified against `server.proxy_protocol_trusted_cidrs`; if this list is empty, PROXY headers are rejected and the connection is considered untrusted.
 
+## [server.conntrack_control]
+
+Note: The conntrack-control worker runs **only on Linux**. On other operating systems it is not started; if `inline_conntrack_control` is `true`, a warning is logged. Effective operation also requires **CAP_NET_ADMIN** and a usable backend (`nft` or `iptables` / `ip6tables` on `PATH`). The `conntrack` utility is used for optional table entry deletes under pressure.
+
+
+| Key | Type | Default |
+| --- | ---- | ------- |
+| [`inline_conntrack_control`](#cfg-server-conntrack_control-inline_conntrack_control) | `bool` | `true` |
+| [`mode`](#cfg-server-conntrack_control-mode) | `String` | `"tracked"` |
+| [`backend`](#cfg-server-conntrack_control-backend) | `String` | `"auto"` |
+| [`profile`](#cfg-server-conntrack_control-profile) | `String` | `"balanced"` |
+| [`hybrid_listener_ips`](#cfg-server-conntrack_control-hybrid_listener_ips) | `IpAddr[]` | `[]` |
+| [`pressure_high_watermark_pct`](#cfg-server-conntrack_control-pressure_high_watermark_pct) | `u8` | `85` |
+| [`pressure_low_watermark_pct`](#cfg-server-conntrack_control-pressure_low_watermark_pct) | `u8` | `70` |
+| [`delete_budget_per_sec`](#cfg-server-conntrack_control-delete_budget_per_sec) | `u64` | `4096` |
+
+<a id="cfg-server-conntrack_control-inline_conntrack_control"></a>
+- `inline_conntrack_control`
+  - **Constraints / validation**: `bool`.
+  - **Description**: Master switch for the runtime conntrack-control task: reconciles **raw/notrack** netfilter rules for listener ingress (see `mode`), samples load every second, and may run **`conntrack -D`** deletes for qualifying close events while **pressure mode** is active (see `delete_budget_per_sec`). When `false`, notrack rules are cleared and pressure-driven deletes are disabled.
+  - **Example**:
+
+    ```toml
+    [server.conntrack_control]
+    inline_conntrack_control = true
+    ```
+<a id="cfg-server-conntrack_control-mode"></a>
+- `mode`
+  - **Constraints / validation**: One of `tracked`, `notrack`, `hybrid` (case-insensitive; serialized lowercase).
+  - **Description**: **`tracked`**: do not install telemt notrack rules (connections stay in conntrack). **`notrack`**: mark matching ingress TCP to `server.port` as notrack — targets are derived from `[[server.listeners]]` if any, otherwise from `server.listen_addr_ipv4` / `server.listen_addr_ipv6` (unspecified addresses mean “any” for that family). **`hybrid`**: notrack only for addresses listed in `hybrid_listener_ips` (must be non-empty; validated at load).
+  - **Example**:
+
+    ```toml
+    [server.conntrack_control]
+    mode = "notrack"
+    ```
+<a id="cfg-server-conntrack_control-backend"></a>
+- `backend`
+  - **Constraints / validation**: One of `auto`, `nftables`, `iptables` (case-insensitive; serialized lowercase).
+  - **Description**: Which command set applies notrack rules. **`auto`**: use `nft` if present on `PATH`, else `iptables`/`ip6tables` if present. **`nftables`** / **`iptables`**: force that backend; missing binary means rules cannot be applied. The nft path uses table `inet telemt_conntrack` and a prerouting raw hook; iptables uses chain `TELEMT_NOTRACK` in the `raw` table.
+  - **Example**:
+
+    ```toml
+    [server.conntrack_control]
+    backend = "auto"
+    ```
+<a id="cfg-server-conntrack_control-profile"></a>
+- `profile`
+  - **Constraints / validation**: One of `conservative`, `balanced`, `aggressive` (case-insensitive; serialized lowercase).
+  - **Description**: When **conntrack pressure mode** is active (`pressure_*` watermarks), caps idle and activity timeouts to reduce conntrack churn: e.g. **client first-byte idle** (`client.rs`), **direct relay activity timeout** (`direct_relay.rs`), and **middle-relay idle policy** caps (`middle_relay.rs` via `ConntrackPressureProfile::*_cap_secs` / `direct_activity_timeout_secs`). More aggressive profiles use shorter caps.
+  - **Example**:
+
+    ```toml
+    [server.conntrack_control]
+    profile = "balanced"
+    ```
+<a id="cfg-server-conntrack_control-hybrid_listener_ips"></a>
+- `hybrid_listener_ips`
+  - **Constraints / validation**: `IpAddr[]`. Required to be **non-empty** when `mode = "hybrid"`. Ignored for `tracked` / `notrack`.
+  - **Description**: Explicit listener addresses that receive notrack rules in hybrid mode (split into IPv4 vs IPv6 rules by the implementation).
+  - **Example**:
+
+    ```toml
+    [server.conntrack_control]
+    mode = "hybrid"
+    hybrid_listener_ips = ["203.0.113.10", "2001:db8::1"]
+    ```
+<a id="cfg-server-conntrack_control-pressure_high_watermark_pct"></a>
+- `pressure_high_watermark_pct`
+  - **Constraints / validation**: Must be within `[1, 100]`.
+  - **Description**: Pressure mode **enters** when any of: connection fill vs `server.max_connections` (percentage, if `max_connections > 0`), **file-descriptor** usage vs process soft `RLIMIT_NOFILE`, **non-zero** `accept_permit_timeout` events in the last sample window, or **ME c2me send-full** counter delta. Entry compares relevant percentages against this high watermark (see `update_pressure_state` in `conntrack_control.rs`).
+  - **Example**:
+
+    ```toml
+    [server.conntrack_control]
+    pressure_high_watermark_pct = 85
+    ```
+<a id="cfg-server-conntrack_control-pressure_low_watermark_pct"></a>
+- `pressure_low_watermark_pct`
+  - **Constraints / validation**: Must be **strictly less than** `pressure_high_watermark_pct`.
+  - **Description**: Pressure mode **clears** only after **three** consecutive one-second samples where all signals are at or below this low watermark and the accept-timeout / ME-queue deltas are zero (hysteresis).
+  - **Example**:
+
+    ```toml
+    [server.conntrack_control]
+    pressure_low_watermark_pct = 70
+    ```
+<a id="cfg-server-conntrack_control-delete_budget_per_sec"></a>
+- `delete_budget_per_sec`
+  - **Constraints / validation**: Must be `> 0`.
+  - **Description**: Maximum number of **`conntrack -D`** attempts **per second** while pressure mode is active (token bucket refilled each second). Deletes run only for close events with reasons **timeout**, **pressure**, or **reset**; each attempt consumes a token regardless of outcome.
+  - **Example**:
+
+    ```toml
+    [server.conntrack_control]
+    delete_budget_per_sec = 4096
+    ```
+
+
 ## [server.api]
 
 Note: This section also accepts the legacy alias `[server.admin_api]` (same schema as `[server.api]`).
