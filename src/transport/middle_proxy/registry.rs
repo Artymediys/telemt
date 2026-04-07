@@ -55,6 +55,20 @@ struct RoutingTable {
     map: DashMap<u64, mpsc::Sender<MeResponse>>,
 }
 
+struct WriterTable {
+    map: DashMap<u64, mpsc::Sender<WriterCommand>>,
+}
+
+#[derive(Clone)]
+struct HotConnBinding {
+    writer_id: u64,
+    meta: ConnMeta,
+}
+
+struct HotBindingTable {
+    map: DashMap<u64, HotConnBinding>,
+}
+
 struct BindingState {
     inner: Mutex<BindingInner>,
 }
@@ -83,6 +97,8 @@ impl BindingInner {
 
 pub struct ConnRegistry {
     routing: RoutingTable,
+    writers: WriterTable,
+    hot_binding: HotBindingTable,
     binding: BindingState,
     next_id: AtomicU64,
     route_channel_capacity: usize,
@@ -103,6 +119,12 @@ impl ConnRegistry {
         let start = rand::random::<u64>() | 1;
         Self {
             routing: RoutingTable {
+                map: DashMap::new(),
+            },
+            writers: WriterTable {
+                map: DashMap::new(),
+            },
+            hot_binding: HotBindingTable {
                 map: DashMap::new(),
             },
             binding: BindingState {
@@ -149,16 +171,18 @@ impl ConnRegistry {
 
     pub async fn register_writer(&self, writer_id: u64, tx: mpsc::Sender<WriterCommand>) {
         let mut binding = self.binding.inner.lock().await;
-        binding.writers.insert(writer_id, tx);
+        binding.writers.insert(writer_id, tx.clone());
         binding
             .conns_for_writer
             .entry(writer_id)
             .or_insert_with(HashSet::new);
+        self.writers.map.insert(writer_id, tx);
     }
 
     /// Unregister connection, returning associated writer_id if any.
     pub async fn unregister(&self, id: u64) -> Option<u64> {
         self.routing.map.remove(&id);
+        self.hot_binding.map.remove(&id);
         let mut binding = self.binding.inner.lock().await;
         binding.meta.remove(&id);
         if let Some(writer_id) = binding.writer_for_conn.remove(&id) {
@@ -325,13 +349,20 @@ impl ConnRegistry {
         }
 
         binding.meta.insert(conn_id, meta.clone());
-        binding.last_meta_for_writer.insert(writer_id, meta);
+        binding.last_meta_for_writer.insert(writer_id, meta.clone());
         binding.writer_idle_since_epoch_secs.remove(&writer_id);
         binding
             .conns_for_writer
             .entry(writer_id)
             .or_insert_with(HashSet::new)
             .insert(conn_id);
+        self.hot_binding.map.insert(
+            conn_id,
+            HotConnBinding {
+                writer_id,
+                meta,
+            },
+        );
         true
     }
 
@@ -392,39 +423,12 @@ impl ConnRegistry {
     }
 
     pub async fn get_writer(&self, conn_id: u64) -> Option<ConnWriter> {
-        let mut binding = self.binding.inner.lock().await;
-        // ROUTING IS THE SOURCE OF TRUTH:
-        // stale bindings are ignored and lazily cleaned when routing no longer
-        // contains the connection.
         if !self.routing.map.contains_key(&conn_id) {
-            binding.meta.remove(&conn_id);
-            if let Some(stale_writer_id) = binding.writer_for_conn.remove(&conn_id)
-                && let Some(conns) = binding.conns_for_writer.get_mut(&stale_writer_id)
-            {
-                conns.remove(&conn_id);
-                if conns.is_empty() {
-                    binding
-                        .writer_idle_since_epoch_secs
-                        .insert(stale_writer_id, Self::now_epoch_secs());
-                }
-            }
             return None;
         }
 
-        let writer_id = binding.writer_for_conn.get(&conn_id).copied()?;
-        let Some(writer) = binding.writers.get(&writer_id).cloned() else {
-            binding.writer_for_conn.remove(&conn_id);
-            binding.meta.remove(&conn_id);
-            if let Some(conns) = binding.conns_for_writer.get_mut(&writer_id) {
-                conns.remove(&conn_id);
-                if conns.is_empty() {
-                    binding
-                        .writer_idle_since_epoch_secs
-                        .insert(writer_id, Self::now_epoch_secs());
-                }
-            }
-            return None;
-        };
+        let writer_id = self.hot_binding.map.get(&conn_id).map(|entry| entry.writer_id)?;
+        let writer = self.writers.map.get(&writer_id).map(|entry| entry.value().clone())?;
         Some(ConnWriter {
             writer_id,
             tx: writer,
@@ -439,6 +443,7 @@ impl ConnRegistry {
     pub async fn writer_lost(&self, writer_id: u64) -> Vec<BoundConn> {
         let mut binding = self.binding.inner.lock().await;
         binding.writers.remove(&writer_id);
+        self.writers.map.remove(&writer_id);
         binding.last_meta_for_writer.remove(&writer_id);
         binding.writer_idle_since_epoch_secs.remove(&writer_id);
         let conns = binding
@@ -454,6 +459,15 @@ impl ConnRegistry {
                 continue;
             }
             binding.writer_for_conn.remove(&conn_id);
+            let remove_hot = self
+                .hot_binding
+                .map
+                .get(&conn_id)
+                .map(|hot| hot.writer_id == writer_id)
+                .unwrap_or(false);
+            if remove_hot {
+                self.hot_binding.map.remove(&conn_id);
+            }
             if let Some(m) = binding.meta.get(&conn_id) {
                 out.push(BoundConn {
                     conn_id,
@@ -466,8 +480,10 @@ impl ConnRegistry {
 
     #[allow(dead_code)]
     pub async fn get_meta(&self, conn_id: u64) -> Option<ConnMeta> {
-        let binding = self.binding.inner.lock().await;
-        binding.meta.get(&conn_id).cloned()
+        self.hot_binding
+            .map
+            .get(&conn_id)
+            .map(|entry| entry.meta.clone())
     }
 
     pub async fn is_writer_empty(&self, writer_id: u64) -> bool {
@@ -491,6 +507,7 @@ impl ConnRegistry {
         }
 
         binding.writers.remove(&writer_id);
+        self.writers.map.remove(&writer_id);
         binding.last_meta_for_writer.remove(&writer_id);
         binding.writer_idle_since_epoch_secs.remove(&writer_id);
         binding.conns_for_writer.remove(&writer_id);

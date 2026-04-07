@@ -339,31 +339,35 @@ fn is_process_running(pid: i32) -> bool {
 
 /// Drops privileges to the specified user and group.
 ///
-/// This should be called after binding privileged ports but before
-/// entering the main event loop.
-pub fn drop_privileges(user: Option<&str>, group: Option<&str>) -> Result<(), DaemonError> {
-    // Look up group first (need to do this while still root)
+/// This should be called after binding privileged ports but before entering
+/// the main event loop.
+pub fn drop_privileges(
+    user: Option<&str>,
+    group: Option<&str>,
+    pid_file: Option<&PidFile>,
+) -> Result<(), DaemonError> {
     let target_gid = if let Some(group_name) = group {
         Some(lookup_group(group_name)?)
     } else if let Some(user_name) = user {
-        // If no group specified but user is, use user's primary group
         Some(lookup_user_primary_gid(user_name)?)
     } else {
         None
     };
 
-    // Look up user
     let target_uid = if let Some(user_name) = user {
         Some(lookup_user(user_name)?)
     } else {
         None
     };
 
-    // Drop privileges: set GID first, then UID
-    // (Setting UID first would prevent us from setting GID)
+    if (target_uid.is_some() || target_gid.is_some())
+        && let Some(file) = pid_file.and_then(|pid| pid.file.as_ref())
+    {
+        unistd::fchown(file, target_uid, target_gid).map_err(DaemonError::PrivilegeDrop)?;
+    }
+
     if let Some(gid) = target_gid {
         unistd::setgid(gid).map_err(DaemonError::PrivilegeDrop)?;
-        // Also set supplementary groups to just this one
         unistd::setgroups(&[gid]).map_err(DaemonError::PrivilegeDrop)?;
         info!(gid = gid.as_raw(), "Dropped group privileges");
     }
@@ -371,6 +375,38 @@ pub fn drop_privileges(user: Option<&str>, group: Option<&str>) -> Result<(), Da
     if let Some(uid) = target_uid {
         unistd::setuid(uid).map_err(DaemonError::PrivilegeDrop)?;
         info!(uid = uid.as_raw(), "Dropped user privileges");
+
+        if uid.as_raw() != 0
+            && let Some(pid) = pid_file
+        {
+            let parent = pid.path.parent().unwrap_or(Path::new("."));
+            let probe_path = parent.join(format!(
+                ".telemt_pid_probe_{}_{}",
+                std::process::id(),
+                getpid().as_raw()
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&probe_path)
+                .map_err(|e| {
+                    DaemonError::PidFile(format!(
+                        "cannot create probe in PID directory {} as uid {} (pid cleanup will fail): {}",
+                        parent.display(),
+                        uid.as_raw(),
+                        e
+                    ))
+                })?;
+            fs::remove_file(&probe_path).map_err(|e| {
+                DaemonError::PidFile(format!(
+                    "cannot remove probe in PID directory {} as uid {} (pid cleanup will fail): {}",
+                    parent.display(),
+                    uid.as_raw(),
+                    e
+                ))
+            })?;
+        }
     }
 
     Ok(())

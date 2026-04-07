@@ -3,6 +3,9 @@
 ***Löst Probleme, bevor andere überhaupt wissen, dass sie existieren*** / ***It solves problems before others even realize they exist***
 
 ### [**Telemt Chat in Telegram**](https://t.me/telemtrs)
+#### Fixed TLS ClientHello is now available in Telegram Desktop starting from version 6.7.2: to work with EE-MTProxy, please update your client;
+#### Fixed TLS ClientHello for Telegram Android Client is available in [our chat](https://t.me/telemtrs/30234/36441); official releases for Android and iOS are "work in progress";
+
 
 **Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements such as:
 - [ME Pool + Reader/Writer + Registry + Refill + Adaptive Floor + Trio-State + Generation Lifecycle](https://github.com/telemt/telemt/blob/main/docs/model/MODEL.en.md)
@@ -51,8 +54,12 @@
 - [FAQ EN](docs/FAQ.en.md)
 
 ### Recognizability for DPI and crawler
-Since version 1.1.0.0, we have debugged masking perfectly: for all clients without "presenting" a key, 
-we transparently direct traffic to the target host!
+
+On April 1, 2026, we became aware of a method for detecting MTProxy Fake-TLS, 
+based on the ECH extension and the ordering of cipher suites, 
+as well as an overall unique JA3/JA4 fingerprint 
+that does not occur in modern browsers: 
+we have already submitted initial changes to the Telegram Desktop developers and are working on updates for other clients.
 
 - We consider this a breakthrough aspect, which has no stable analogues today
 - Based on this: if `telemt` configured correctly, **TLS mode is completely identical to real-life handshake + communication** with a specified host

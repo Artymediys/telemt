@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
@@ -15,11 +16,123 @@ use crate::error::{ProxyError, Result};
 use super::defaults::*;
 use super::types::*;
 
+const ACCESS_SECRET_BYTES: usize = 16;
+const MAX_ME_WRITER_CMD_CHANNEL_CAPACITY: usize = 16_384;
+const MAX_ME_ROUTE_CHANNEL_CAPACITY: usize = 8_192;
+const MAX_ME_C2ME_CHANNEL_CAPACITY: usize = 8_192;
+const MIN_MAX_CLIENT_FRAME_BYTES: usize = 4 * 1024;
+const MAX_MAX_CLIENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedConfig {
     pub(crate) config: ProxyConfig,
     pub(crate) source_files: Vec<PathBuf>,
     pub(crate) rendered_hash: u64,
+}
+
+/// Precomputed, immutable user authentication data used by handshake hot paths.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UserAuthSnapshot {
+    entries: Vec<UserAuthEntry>,
+    by_name: HashMap<String, u32>,
+    sni_index: HashMap<u64, Vec<u32>>,
+    sni_initial_index: HashMap<u8, Vec<u32>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UserAuthEntry {
+    pub(crate) user: String,
+    pub(crate) secret: [u8; ACCESS_SECRET_BYTES],
+}
+
+impl UserAuthSnapshot {
+    fn from_users(users: &HashMap<String, String>) -> Result<Self> {
+        let mut entries = Vec::with_capacity(users.len());
+        let mut by_name = HashMap::with_capacity(users.len());
+        let mut sni_index = HashMap::with_capacity(users.len());
+        let mut sni_initial_index = HashMap::with_capacity(users.len());
+
+        for (user, secret_hex) in users {
+            let decoded = hex::decode(secret_hex).map_err(|_| ProxyError::InvalidSecret {
+                user: user.clone(),
+                reason: "Must be 32 hex characters".to_string(),
+            })?;
+            if decoded.len() != ACCESS_SECRET_BYTES {
+                return Err(ProxyError::InvalidSecret {
+                    user: user.clone(),
+                    reason: "Must be 32 hex characters".to_string(),
+                });
+            }
+
+            let user_id = u32::try_from(entries.len()).map_err(|_| {
+                ProxyError::Config("Too many users for runtime auth snapshot".to_string())
+            })?;
+
+            let mut secret = [0u8; ACCESS_SECRET_BYTES];
+            secret.copy_from_slice(&decoded);
+            entries.push(UserAuthEntry {
+                user: user.clone(),
+                secret,
+            });
+            by_name.insert(user.clone(), user_id);
+            sni_index
+                .entry(Self::sni_lookup_hash(user))
+                .or_insert_with(Vec::new)
+                .push(user_id);
+            if let Some(initial) = user
+                .as_bytes()
+                .first()
+                .map(|byte| byte.to_ascii_lowercase())
+            {
+                sni_initial_index
+                    .entry(initial)
+                    .or_insert_with(Vec::new)
+                    .push(user_id);
+            }
+        }
+
+        Ok(Self {
+            entries,
+            by_name,
+            sni_index,
+            sni_initial_index,
+        })
+    }
+
+    pub(crate) fn entries(&self) -> &[UserAuthEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn user_id_by_name(&self, user: &str) -> Option<u32> {
+        self.by_name.get(user).copied()
+    }
+
+    pub(crate) fn entry_by_id(&self, user_id: u32) -> Option<&UserAuthEntry> {
+        let idx = usize::try_from(user_id).ok()?;
+        self.entries.get(idx)
+    }
+
+    pub(crate) fn sni_candidates(&self, sni: &str) -> Option<&[u32]> {
+        self.sni_index
+            .get(&Self::sni_lookup_hash(sni))
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn sni_initial_candidates(&self, sni: &str) -> Option<&[u32]> {
+        let initial = sni
+            .as_bytes()
+            .first()
+            .map(|byte| byte.to_ascii_lowercase())?;
+        self.sni_initial_index.get(&initial).map(Vec::as_slice)
+    }
+
+    fn sni_lookup_hash(value: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for byte in value.bytes() {
+            hasher.write_u8(byte.to_ascii_lowercase());
+        }
+        hasher.finish()
+    }
 }
 
 fn normalize_config_path(path: &Path) -> PathBuf {
@@ -196,6 +309,10 @@ pub struct ProxyConfig {
     /// If not set, defaults to 2 (matching Telegram's official `default 2;` in proxy-multi.conf).
     #[serde(default)]
     pub default_dc: Option<u8>,
+
+    /// Precomputed authentication snapshot for handshake hot paths.
+    #[serde(skip)]
+    pub(crate) runtime_user_auth: Option<Arc<UserAuthSnapshot>>,
 }
 
 impl ProxyConfig {
@@ -514,17 +631,40 @@ impl ProxyConfig {
                 "general.me_writer_cmd_channel_capacity must be > 0".to_string(),
             ));
         }
+        if config.general.me_writer_cmd_channel_capacity > MAX_ME_WRITER_CMD_CHANNEL_CAPACITY {
+            return Err(ProxyError::Config(format!(
+                "general.me_writer_cmd_channel_capacity must be within [1, {MAX_ME_WRITER_CMD_CHANNEL_CAPACITY}]"
+            )));
+        }
 
         if config.general.me_route_channel_capacity == 0 {
             return Err(ProxyError::Config(
                 "general.me_route_channel_capacity must be > 0".to_string(),
             ));
         }
+        if config.general.me_route_channel_capacity > MAX_ME_ROUTE_CHANNEL_CAPACITY {
+            return Err(ProxyError::Config(format!(
+                "general.me_route_channel_capacity must be within [1, {MAX_ME_ROUTE_CHANNEL_CAPACITY}]"
+            )));
+        }
 
         if config.general.me_c2me_channel_capacity == 0 {
             return Err(ProxyError::Config(
                 "general.me_c2me_channel_capacity must be > 0".to_string(),
             ));
+        }
+        if config.general.me_c2me_channel_capacity > MAX_ME_C2ME_CHANNEL_CAPACITY {
+            return Err(ProxyError::Config(format!(
+                "general.me_c2me_channel_capacity must be within [1, {MAX_ME_C2ME_CHANNEL_CAPACITY}]"
+            )));
+        }
+
+        if !(MIN_MAX_CLIENT_FRAME_BYTES..=MAX_MAX_CLIENT_FRAME_BYTES)
+            .contains(&config.general.max_client_frame)
+        {
+            return Err(ProxyError::Config(format!(
+                "general.max_client_frame must be within [{MIN_MAX_CLIENT_FRAME_BYTES}, {MAX_MAX_CLIENT_FRAME_BYTES}]"
+            )));
         }
 
         if config.general.me_c2me_send_timeout_ms > 60_000 {
@@ -922,6 +1062,43 @@ impl ProxyConfig {
             ));
         }
 
+        if config.server.conntrack_control.pressure_high_watermark_pct == 0
+            || config.server.conntrack_control.pressure_high_watermark_pct > 100
+        {
+            return Err(ProxyError::Config(
+                "server.conntrack_control.pressure_high_watermark_pct must be within [1, 100]"
+                    .to_string(),
+            ));
+        }
+
+        if config.server.conntrack_control.pressure_low_watermark_pct
+            >= config.server.conntrack_control.pressure_high_watermark_pct
+        {
+            return Err(ProxyError::Config(
+                "server.conntrack_control.pressure_low_watermark_pct must be < pressure_high_watermark_pct"
+                    .to_string(),
+            ));
+        }
+
+        if config.server.conntrack_control.delete_budget_per_sec == 0 {
+            return Err(ProxyError::Config(
+                "server.conntrack_control.delete_budget_per_sec must be > 0".to_string(),
+            ));
+        }
+
+        if matches!(config.server.conntrack_control.mode, ConntrackMode::Hybrid)
+            && config
+                .server
+                .conntrack_control
+                .hybrid_listener_ips
+                .is_empty()
+        {
+            return Err(ProxyError::Config(
+                "server.conntrack_control.hybrid_listener_ips must be non-empty in mode=hybrid"
+                    .to_string(),
+            ));
+        }
+
         if config.general.effective_me_pool_force_close_secs() > 0
             && config.general.effective_me_pool_force_close_secs()
                 < config.general.me_pool_drain_ttl_secs
@@ -1127,12 +1304,23 @@ impl ProxyConfig {
             .or_insert_with(|| vec!["91.105.192.100:443".to_string()]);
 
         validate_upstreams(&config)?;
+        config.rebuild_runtime_user_auth()?;
 
         Ok(LoadedConfig {
             config,
             source_files: source_files.into_iter().collect(),
             rendered_hash: hash_rendered_snapshot(&processed),
         })
+    }
+
+    pub(crate) fn rebuild_runtime_user_auth(&mut self) -> Result<()> {
+        let snapshot = UserAuthSnapshot::from_users(&self.access.users)?;
+        self.runtime_user_auth = Some(Arc::new(snapshot));
+        Ok(())
+    }
+
+    pub(crate) fn runtime_user_auth(&self) -> Option<&UserAuthSnapshot> {
+        self.runtime_user_auth.as_deref()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1185,6 +1373,10 @@ mod load_mask_shape_security_tests;
 #[cfg(test)]
 #[path = "tests/load_mask_classifier_prefetch_timeout_security_tests.rs"]
 mod load_mask_classifier_prefetch_timeout_security_tests;
+
+#[cfg(test)]
+#[path = "tests/load_memory_envelope_tests.rs"]
+mod load_memory_envelope_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1326,6 +1518,31 @@ mod tests {
         assert_eq!(
             cfg.server.api.runtime_edge_events_capacity,
             default_api_runtime_edge_events_capacity()
+        );
+        assert_eq!(
+            cfg.server.conntrack_control.inline_conntrack_control,
+            default_conntrack_control_enabled()
+        );
+        assert_eq!(cfg.server.conntrack_control.mode, ConntrackMode::default());
+        assert_eq!(
+            cfg.server.conntrack_control.backend,
+            ConntrackBackend::default()
+        );
+        assert_eq!(
+            cfg.server.conntrack_control.profile,
+            ConntrackPressureProfile::default()
+        );
+        assert_eq!(
+            cfg.server.conntrack_control.pressure_high_watermark_pct,
+            default_conntrack_pressure_high_watermark_pct()
+        );
+        assert_eq!(
+            cfg.server.conntrack_control.pressure_low_watermark_pct,
+            default_conntrack_pressure_low_watermark_pct()
+        );
+        assert_eq!(
+            cfg.server.conntrack_control.delete_budget_per_sec,
+            default_conntrack_delete_budget_per_sec()
         );
         assert_eq!(cfg.access.users, default_access_users());
         assert_eq!(
@@ -1472,6 +1689,31 @@ mod tests {
             server.api.runtime_edge_events_capacity,
             default_api_runtime_edge_events_capacity()
         );
+        assert_eq!(
+            server.conntrack_control.inline_conntrack_control,
+            default_conntrack_control_enabled()
+        );
+        assert_eq!(server.conntrack_control.mode, ConntrackMode::default());
+        assert_eq!(
+            server.conntrack_control.backend,
+            ConntrackBackend::default()
+        );
+        assert_eq!(
+            server.conntrack_control.profile,
+            ConntrackPressureProfile::default()
+        );
+        assert_eq!(
+            server.conntrack_control.pressure_high_watermark_pct,
+            default_conntrack_pressure_high_watermark_pct()
+        );
+        assert_eq!(
+            server.conntrack_control.pressure_low_watermark_pct,
+            default_conntrack_pressure_low_watermark_pct()
+        );
+        assert_eq!(
+            server.conntrack_control.delete_budget_per_sec,
+            default_conntrack_delete_budget_per_sec()
+        );
 
         let access = AccessConfig::default();
         assert_eq!(access.users, default_access_users());
@@ -1547,6 +1789,22 @@ mod tests {
         assert_eq!(
             cfg_mask.censorship.unknown_sni_action,
             UnknownSniAction::Mask
+        );
+
+        let cfg_accept: ProxyConfig = toml::from_str(
+            r#"
+            [server]
+            [general]
+            [network]
+            [access]
+            [censorship]
+            unknown_sni_action = "accept"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg_accept.censorship.unknown_sni_action,
+            UnknownSniAction::Accept
         );
     }
 
@@ -2401,6 +2659,118 @@ mod tests {
         std::fs::write(&path, toml).unwrap();
         let err = ProxyConfig::load(&path).unwrap_err().to_string();
         assert!(err.contains("server.api.runtime_edge_events_capacity must be within [16, 4096]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn conntrack_pressure_high_watermark_out_of_range_is_rejected() {
+        let toml = r#"
+            [server.conntrack_control]
+            pressure_high_watermark_pct = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_conntrack_high_watermark_invalid_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains(
+            "server.conntrack_control.pressure_high_watermark_pct must be within [1, 100]"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn conntrack_pressure_low_watermark_must_be_below_high() {
+        let toml = r#"
+            [server.conntrack_control]
+            pressure_high_watermark_pct = 50
+            pressure_low_watermark_pct = 50
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_conntrack_low_watermark_invalid_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "server.conntrack_control.pressure_low_watermark_pct must be < pressure_high_watermark_pct"
+            )
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn conntrack_delete_budget_zero_is_rejected() {
+        let toml = r#"
+            [server.conntrack_control]
+            delete_budget_per_sec = 0
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_conntrack_delete_budget_invalid_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("server.conntrack_control.delete_budget_per_sec must be > 0"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn conntrack_hybrid_mode_requires_listener_allow_list() {
+        let toml = r#"
+            [server.conntrack_control]
+            mode = "hybrid"
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_conntrack_hybrid_requires_ips_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains(
+            "server.conntrack_control.hybrid_listener_ips must be non-empty in mode=hybrid"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn conntrack_profile_is_loaded_from_config() {
+        let toml = r#"
+            [server.conntrack_control]
+            profile = "aggressive"
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_conntrack_profile_parse_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.server.conntrack_control.profile,
+            ConntrackPressureProfile::Aggressive
+        );
         let _ = std::fs::remove_file(path);
     }
 

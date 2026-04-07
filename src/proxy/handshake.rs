@@ -4,13 +4,19 @@
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use hmac::{Hmac, Mac};
+#[cfg(test)]
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+#[cfg(test)]
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, trace, warn};
@@ -21,15 +27,17 @@ use crate::crypto::{AesCtr, SecureRandom, sha256};
 use crate::error::{HandshakeResult, ProxyError};
 use crate::protocol::constants::*;
 use crate::protocol::tls;
+use crate::proxy::shared_state::ProxySharedState;
 use crate::stats::ReplayChecker;
 use crate::stream::{CryptoReader, CryptoWriter, FakeTlsReader, FakeTlsWriter};
 use crate::tls_front::{TlsFrontCache, emulator};
+#[cfg(test)]
 use rand::RngExt;
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 const ACCESS_SECRET_BYTES: usize = 16;
-static INVALID_SECRET_WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
 const UNKNOWN_SNI_WARN_COOLDOWN_SECS: u64 = 5;
-static UNKNOWN_SNI_WARN_NEXT_ALLOWED: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 #[cfg(test)]
 const WARNED_SECRET_MAX_ENTRIES: usize = 64;
 #[cfg(not(test))]
@@ -43,6 +51,13 @@ const AUTH_PROBE_TRACK_MAX_ENTRIES: usize = 65_536;
 const AUTH_PROBE_PRUNE_SCAN_LIMIT: usize = 1_024;
 const AUTH_PROBE_BACKOFF_START_FAILS: u32 = 4;
 const AUTH_PROBE_SATURATION_GRACE_FAILS: u32 = 2;
+const STICKY_HINT_MAX_ENTRIES: usize = 65_536;
+const CANDIDATE_HINT_TRACK_CAP: usize = 64;
+const OVERLOAD_CANDIDATE_BUDGET_HINTED: usize = 16;
+const OVERLOAD_CANDIDATE_BUDGET_UNHINTED: usize = 8;
+const RECENT_USER_RING_SCAN_LIMIT: usize = 32;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[cfg(test)]
 const AUTH_PROBE_BACKOFF_BASE_MS: u64 = 1;
@@ -55,48 +70,30 @@ const AUTH_PROBE_BACKOFF_MAX_MS: u64 = 16;
 const AUTH_PROBE_BACKOFF_MAX_MS: u64 = 1_000;
 
 #[derive(Clone, Copy)]
-struct AuthProbeState {
+pub(crate) struct AuthProbeState {
     fail_streak: u32,
     blocked_until: Instant,
     last_seen: Instant,
 }
 
 #[derive(Clone, Copy)]
-struct AuthProbeSaturationState {
+pub(crate) struct AuthProbeSaturationState {
     fail_streak: u32,
     blocked_until: Instant,
     last_seen: Instant,
 }
-
-static AUTH_PROBE_STATE: OnceLock<DashMap<IpAddr, AuthProbeState>> = OnceLock::new();
-static AUTH_PROBE_SATURATION_STATE: OnceLock<Mutex<Option<AuthProbeSaturationState>>> =
-    OnceLock::new();
-static AUTH_PROBE_EVICTION_HASHER: OnceLock<RandomState> = OnceLock::new();
-
-fn auth_probe_state_map() -> &'static DashMap<IpAddr, AuthProbeState> {
-    AUTH_PROBE_STATE.get_or_init(DashMap::new)
-}
-
-fn auth_probe_saturation_state() -> &'static Mutex<Option<AuthProbeSaturationState>> {
-    AUTH_PROBE_SATURATION_STATE.get_or_init(|| Mutex::new(None))
-}
-
-fn auth_probe_saturation_state_lock()
--> std::sync::MutexGuard<'static, Option<AuthProbeSaturationState>> {
-    auth_probe_saturation_state()
+fn unknown_sni_warn_state_lock_in(
+    shared: &ProxySharedState,
+) -> std::sync::MutexGuard<'_, Option<Instant>> {
+    shared
+        .handshake
+        .unknown_sni_warn_next_allowed
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn unknown_sni_warn_state_lock() -> std::sync::MutexGuard<'static, Option<Instant>> {
-    UNKNOWN_SNI_WARN_NEXT_ALLOWED
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn should_emit_unknown_sni_warn(now: Instant) -> bool {
-    let mut guard = unknown_sni_warn_state_lock();
+fn should_emit_unknown_sni_warn_in(shared: &ProxySharedState, now: Instant) -> bool {
+    let mut guard = unknown_sni_warn_state_lock_in(shared);
     if let Some(next_allowed) = *guard
         && now < next_allowed
     {
@@ -104,6 +101,302 @@ fn should_emit_unknown_sni_warn(now: Instant) -> bool {
     }
     *guard = Some(now + Duration::from_secs(UNKNOWN_SNI_WARN_COOLDOWN_SECS));
     true
+}
+
+#[derive(Clone, Copy)]
+struct ParsedTlsAuthMaterial {
+    digest: [u8; tls::TLS_DIGEST_LEN],
+    session_id: [u8; 32],
+    session_id_len: usize,
+    now: i64,
+    ignore_time_skew: bool,
+    boot_time_cap_secs: u32,
+}
+
+#[derive(Clone, Copy)]
+struct TlsCandidateValidation {
+    digest: [u8; tls::TLS_DIGEST_LEN],
+    session_id: [u8; 32],
+    session_id_len: usize,
+}
+
+struct MtprotoCandidateValidation {
+    proto_tag: ProtoTag,
+    dc_idx: i16,
+    dec_key: [u8; 32],
+    dec_iv: u128,
+    enc_key: [u8; 32],
+    enc_iv: u128,
+    decryptor: AesCtr,
+    encryptor: AesCtr,
+}
+
+fn sni_hint_hash(sni: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for byte in sni.bytes() {
+        hasher.write_u8(byte.to_ascii_lowercase());
+    }
+    hasher.finish()
+}
+
+fn ip_prefix_hint_key(peer_ip: IpAddr) -> u64 {
+    match peer_ip {
+        // Keep /24 granularity for IPv4 to avoid over-merging unrelated clients.
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            u64::from_be_bytes([0x04, a, b, c, 0, 0, 0, 0])
+        }
+        // Keep /56 granularity for IPv6 to retain stability while limiting bucket size.
+        IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            u64::from_be_bytes([
+                0x06, octets[0], octets[1], octets[2], octets[3], octets[4], octets[5], octets[6],
+            ])
+        }
+    }
+}
+
+fn sticky_hint_get_by_ip(shared: &ProxySharedState, peer_ip: IpAddr) -> Option<u32> {
+    shared
+        .handshake
+        .sticky_user_by_ip
+        .get(&peer_ip)
+        .map(|entry| *entry)
+}
+
+fn sticky_hint_get_by_ip_prefix(shared: &ProxySharedState, peer_ip: IpAddr) -> Option<u32> {
+    shared
+        .handshake
+        .sticky_user_by_ip_prefix
+        .get(&ip_prefix_hint_key(peer_ip))
+        .map(|entry| *entry)
+}
+
+fn sticky_hint_get_by_sni(shared: &ProxySharedState, sni: &str) -> Option<u32> {
+    let key = sni_hint_hash(sni);
+    shared
+        .handshake
+        .sticky_user_by_sni_hash
+        .get(&key)
+        .map(|entry| *entry)
+}
+
+fn sticky_hint_record_success_in(
+    shared: &ProxySharedState,
+    peer_ip: IpAddr,
+    user_id: u32,
+    sni: Option<&str>,
+) {
+    if shared.handshake.sticky_user_by_ip.len() > STICKY_HINT_MAX_ENTRIES {
+        shared.handshake.sticky_user_by_ip.clear();
+    }
+    shared.handshake.sticky_user_by_ip.insert(peer_ip, user_id);
+
+    if shared.handshake.sticky_user_by_ip_prefix.len() > STICKY_HINT_MAX_ENTRIES {
+        shared.handshake.sticky_user_by_ip_prefix.clear();
+    }
+    shared
+        .handshake
+        .sticky_user_by_ip_prefix
+        .insert(ip_prefix_hint_key(peer_ip), user_id);
+
+    if let Some(sni) = sni {
+        if shared.handshake.sticky_user_by_sni_hash.len() > STICKY_HINT_MAX_ENTRIES {
+            shared.handshake.sticky_user_by_sni_hash.clear();
+        }
+        shared
+            .handshake
+            .sticky_user_by_sni_hash
+            .insert(sni_hint_hash(sni), user_id);
+    }
+}
+
+fn record_recent_user_success_in(shared: &ProxySharedState, user_id: u32) {
+    let ring = &shared.handshake.recent_user_ring;
+    if ring.is_empty() {
+        return;
+    }
+    let seq = shared
+        .handshake
+        .recent_user_ring_seq
+        .fetch_add(1, Ordering::Relaxed);
+    let idx = (seq as usize) % ring.len();
+    ring[idx].store(user_id.saturating_add(1), Ordering::Relaxed);
+}
+
+fn mark_candidate_if_new(tried_user_ids: &mut [u32], tried_len: &mut usize, user_id: u32) -> bool {
+    if tried_user_ids[..*tried_len].contains(&user_id) {
+        return false;
+    }
+    if *tried_len < tried_user_ids.len() {
+        tried_user_ids[*tried_len] = user_id;
+        *tried_len += 1;
+    }
+    true
+}
+
+fn budget_for_validation(total_users: usize, overload: bool, has_hint: bool) -> usize {
+    if total_users == 0 {
+        return 0;
+    }
+    if !overload {
+        return total_users;
+    }
+    let cap = if has_hint {
+        OVERLOAD_CANDIDATE_BUDGET_HINTED
+    } else {
+        OVERLOAD_CANDIDATE_BUDGET_UNHINTED
+    };
+    total_users.min(cap.max(1))
+}
+
+fn parse_tls_auth_material(
+    handshake: &[u8],
+    ignore_time_skew: bool,
+    replay_window_secs: u64,
+) -> Option<ParsedTlsAuthMaterial> {
+    if handshake.len() < tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN + 1 {
+        return None;
+    }
+
+    let digest: [u8; tls::TLS_DIGEST_LEN] = handshake
+        [tls::TLS_DIGEST_POS..tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN]
+        .try_into()
+        .ok()?;
+
+    let session_id_len_pos = tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN;
+    let session_id_len = usize::from(handshake.get(session_id_len_pos).copied()?);
+    if session_id_len > 32 {
+        return None;
+    }
+    let session_id_start = session_id_len_pos + 1;
+    if handshake.len() < session_id_start + session_id_len {
+        return None;
+    }
+
+    let mut session_id = [0u8; 32];
+    session_id[..session_id_len]
+        .copy_from_slice(&handshake[session_id_start..session_id_start + session_id_len]);
+
+    let now = if !ignore_time_skew {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        i64::try_from(d.as_secs()).ok()?
+    } else {
+        0_i64
+    };
+
+    let replay_window_u32 = u32::try_from(replay_window_secs).unwrap_or(u32::MAX);
+    let boot_time_cap_secs = if ignore_time_skew {
+        0
+    } else {
+        tls::BOOT_TIME_MAX_SECS
+            .min(replay_window_u32)
+            .min(tls::BOOT_TIME_COMPAT_MAX_SECS)
+    };
+
+    Some(ParsedTlsAuthMaterial {
+        digest,
+        session_id,
+        session_id_len,
+        now,
+        ignore_time_skew,
+        boot_time_cap_secs,
+    })
+}
+
+fn compute_tls_hmac_zeroed_digest(secret: &[u8], handshake: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(&handshake[..tls::TLS_DIGEST_POS]);
+    mac.update(&[0u8; tls::TLS_DIGEST_LEN]);
+    mac.update(&handshake[tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN..]);
+    mac.finalize().into_bytes().into()
+}
+
+fn validate_tls_secret_candidate(
+    parsed: &ParsedTlsAuthMaterial,
+    handshake: &[u8],
+    secret: &[u8],
+) -> Option<TlsCandidateValidation> {
+    let computed = compute_tls_hmac_zeroed_digest(secret, handshake);
+    if !bool::from(parsed.digest[..28].ct_eq(&computed[..28])) {
+        return None;
+    }
+
+    let timestamp = u32::from_le_bytes([
+        parsed.digest[28] ^ computed[28],
+        parsed.digest[29] ^ computed[29],
+        parsed.digest[30] ^ computed[30],
+        parsed.digest[31] ^ computed[31],
+    ]);
+
+    if !parsed.ignore_time_skew {
+        let is_boot_time = parsed.boot_time_cap_secs > 0 && timestamp < parsed.boot_time_cap_secs;
+        if !is_boot_time {
+            let time_diff = parsed.now - i64::from(timestamp);
+            if !(tls::TIME_SKEW_MIN..=tls::TIME_SKEW_MAX).contains(&time_diff) {
+                return None;
+            }
+        }
+    }
+
+    Some(TlsCandidateValidation {
+        digest: parsed.digest,
+        session_id: parsed.session_id,
+        session_id_len: parsed.session_id_len,
+    })
+}
+
+fn validate_mtproto_secret_candidate(
+    handshake: &[u8; HANDSHAKE_LEN],
+    dec_prekey: &[u8; PREKEY_LEN],
+    dec_iv: u128,
+    enc_prekey: &[u8; PREKEY_LEN],
+    enc_iv: u128,
+    secret: &[u8; ACCESS_SECRET_BYTES],
+    config: &ProxyConfig,
+    is_tls: bool,
+) -> Option<MtprotoCandidateValidation> {
+    let mut dec_key_input = Zeroizing::new(Vec::with_capacity(PREKEY_LEN + secret.len()));
+    dec_key_input.extend_from_slice(dec_prekey);
+    dec_key_input.extend_from_slice(secret);
+    let dec_key = Zeroizing::new(sha256(&dec_key_input));
+
+    let mut decryptor = AesCtr::new(&dec_key, dec_iv);
+    let mut decrypted = *handshake;
+    decryptor.apply(&mut decrypted);
+
+    let tag_bytes: [u8; 4] = [
+        decrypted[PROTO_TAG_POS],
+        decrypted[PROTO_TAG_POS + 1],
+        decrypted[PROTO_TAG_POS + 2],
+        decrypted[PROTO_TAG_POS + 3],
+    ];
+    let proto_tag = ProtoTag::from_bytes(tag_bytes)?;
+    if !mode_enabled_for_proto(config, proto_tag, is_tls) {
+        return None;
+    }
+
+    let dc_idx = i16::from_le_bytes([decrypted[DC_IDX_POS], decrypted[DC_IDX_POS + 1]]);
+
+    let mut enc_key_input = Zeroizing::new(Vec::with_capacity(PREKEY_LEN + secret.len()));
+    enc_key_input.extend_from_slice(enc_prekey);
+    enc_key_input.extend_from_slice(secret);
+    let enc_key = Zeroizing::new(sha256(&enc_key_input));
+
+    let encryptor = AesCtr::new(&enc_key, enc_iv);
+
+    Some(MtprotoCandidateValidation {
+        proto_tag,
+        dc_idx,
+        dec_key: *dec_key,
+        dec_iv,
+        enc_key: *enc_key,
+        enc_iv,
+        decryptor,
+        encryptor,
+    })
 }
 
 fn normalize_auth_probe_ip(peer_ip: IpAddr) -> IpAddr {
@@ -133,15 +426,20 @@ fn auth_probe_state_expired(state: &AuthProbeState, now: Instant) -> bool {
     now.duration_since(state.last_seen) > retention
 }
 
-fn auth_probe_eviction_offset(peer_ip: IpAddr, now: Instant) -> usize {
-    let hasher_state = AUTH_PROBE_EVICTION_HASHER.get_or_init(RandomState::new);
+fn auth_probe_eviction_offset_in(
+    shared: &ProxySharedState,
+    peer_ip: IpAddr,
+    now: Instant,
+) -> usize {
+    let hasher_state = &shared.handshake.auth_probe_eviction_hasher;
     let mut hasher = hasher_state.build_hasher();
     peer_ip.hash(&mut hasher);
     now.hash(&mut hasher);
     hasher.finish() as usize
 }
 
-fn auth_probe_scan_start_offset(
+fn auth_probe_scan_start_offset_in(
+    shared: &ProxySharedState,
     peer_ip: IpAddr,
     now: Instant,
     state_len: usize,
@@ -151,12 +449,12 @@ fn auth_probe_scan_start_offset(
         return 0;
     }
 
-    auth_probe_eviction_offset(peer_ip, now) % state_len
+    auth_probe_eviction_offset_in(shared, peer_ip, now) % state_len
 }
 
-fn auth_probe_is_throttled(peer_ip: IpAddr, now: Instant) -> bool {
+fn auth_probe_is_throttled_in(shared: &ProxySharedState, peer_ip: IpAddr, now: Instant) -> bool {
     let peer_ip = normalize_auth_probe_ip(peer_ip);
-    let state = auth_probe_state_map();
+    let state = &shared.handshake.auth_probe;
     let Some(entry) = state.get(&peer_ip) else {
         return false;
     };
@@ -168,9 +466,13 @@ fn auth_probe_is_throttled(peer_ip: IpAddr, now: Instant) -> bool {
     now < entry.blocked_until
 }
 
-fn auth_probe_saturation_grace_exhausted(peer_ip: IpAddr, now: Instant) -> bool {
+fn auth_probe_saturation_grace_exhausted_in(
+    shared: &ProxySharedState,
+    peer_ip: IpAddr,
+    now: Instant,
+) -> bool {
     let peer_ip = normalize_auth_probe_ip(peer_ip);
-    let state = auth_probe_state_map();
+    let state = &shared.handshake.auth_probe;
     let Some(entry) = state.get(&peer_ip) else {
         return false;
     };
@@ -183,20 +485,28 @@ fn auth_probe_saturation_grace_exhausted(peer_ip: IpAddr, now: Instant) -> bool 
     entry.fail_streak >= AUTH_PROBE_BACKOFF_START_FAILS + AUTH_PROBE_SATURATION_GRACE_FAILS
 }
 
-fn auth_probe_should_apply_preauth_throttle(peer_ip: IpAddr, now: Instant) -> bool {
-    if !auth_probe_is_throttled(peer_ip, now) {
+fn auth_probe_should_apply_preauth_throttle_in(
+    shared: &ProxySharedState,
+    peer_ip: IpAddr,
+    now: Instant,
+) -> bool {
+    if !auth_probe_is_throttled_in(shared, peer_ip, now) {
         return false;
     }
 
-    if !auth_probe_saturation_is_throttled(now) {
+    if !auth_probe_saturation_is_throttled_in(shared, now) {
         return true;
     }
 
-    auth_probe_saturation_grace_exhausted(peer_ip, now)
+    auth_probe_saturation_grace_exhausted_in(shared, peer_ip, now)
 }
 
-fn auth_probe_saturation_is_throttled(now: Instant) -> bool {
-    let mut guard = auth_probe_saturation_state_lock();
+fn auth_probe_saturation_is_throttled_in(shared: &ProxySharedState, now: Instant) -> bool {
+    let mut guard = shared
+        .handshake
+        .auth_probe_saturation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let Some(state) = guard.as_mut() else {
         return false;
@@ -214,8 +524,12 @@ fn auth_probe_saturation_is_throttled(now: Instant) -> bool {
     false
 }
 
-fn auth_probe_note_saturation(now: Instant) {
-    let mut guard = auth_probe_saturation_state_lock();
+fn auth_probe_note_saturation_in(shared: &ProxySharedState, now: Instant) {
+    let mut guard = shared
+        .handshake
+        .auth_probe_saturation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     match guard.as_mut() {
         Some(state)
@@ -237,13 +551,14 @@ fn auth_probe_note_saturation(now: Instant) {
     }
 }
 
-fn auth_probe_record_failure(peer_ip: IpAddr, now: Instant) {
+fn auth_probe_record_failure_in(shared: &ProxySharedState, peer_ip: IpAddr, now: Instant) {
     let peer_ip = normalize_auth_probe_ip(peer_ip);
-    let state = auth_probe_state_map();
-    auth_probe_record_failure_with_state(state, peer_ip, now);
+    let state = &shared.handshake.auth_probe;
+    auth_probe_record_failure_with_state_in(shared, state, peer_ip, now);
 }
 
-fn auth_probe_record_failure_with_state(
+fn auth_probe_record_failure_with_state_in(
+    shared: &ProxySharedState,
     state: &DashMap<IpAddr, AuthProbeState>,
     peer_ip: IpAddr,
     now: Instant,
@@ -277,7 +592,7 @@ fn auth_probe_record_failure_with_state(
         while state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
             rounds += 1;
             if rounds > 8 {
-                auth_probe_note_saturation(now);
+                auth_probe_note_saturation_in(shared, now);
                 let mut eviction_candidate: Option<(IpAddr, u32, Instant)> = None;
                 for entry in state.iter().take(AUTH_PROBE_PRUNE_SCAN_LIMIT) {
                     let key = *entry.key();
@@ -320,7 +635,7 @@ fn auth_probe_record_failure_with_state(
                 }
             } else {
                 let start_offset =
-                    auth_probe_scan_start_offset(peer_ip, now, state_len, scan_limit);
+                    auth_probe_scan_start_offset_in(shared, peer_ip, now, state_len, scan_limit);
                 let mut scanned = 0usize;
                 for entry in state.iter().skip(start_offset) {
                     let key = *entry.key();
@@ -369,11 +684,11 @@ fn auth_probe_record_failure_with_state(
             }
 
             let Some((evict_key, _, _)) = eviction_candidate else {
-                auth_probe_note_saturation(now);
+                auth_probe_note_saturation_in(shared, now);
                 return;
             };
             state.remove(&evict_key);
-            auth_probe_note_saturation(now);
+            auth_probe_note_saturation_in(shared, now);
         }
     }
 
@@ -387,89 +702,58 @@ fn auth_probe_record_failure_with_state(
     }
 }
 
-fn auth_probe_record_success(peer_ip: IpAddr) {
+fn auth_probe_record_success_in(shared: &ProxySharedState, peer_ip: IpAddr) {
     let peer_ip = normalize_auth_probe_ip(peer_ip);
-    let state = auth_probe_state_map();
+    let state = &shared.handshake.auth_probe;
     state.remove(&peer_ip);
 }
 
 #[cfg(test)]
-fn clear_auth_probe_state_for_testing() {
-    if let Some(state) = AUTH_PROBE_STATE.get() {
-        state.clear();
-    }
-    if AUTH_PROBE_SATURATION_STATE.get().is_some() {
-        let mut guard = auth_probe_saturation_state_lock();
-        *guard = None;
-    }
+pub(crate) fn auth_probe_record_failure_for_testing(
+    shared: &ProxySharedState,
+    peer_ip: IpAddr,
+    now: Instant,
+) {
+    auth_probe_record_failure_in(shared, peer_ip, now);
 }
 
 #[cfg(test)]
-fn auth_probe_fail_streak_for_testing(peer_ip: IpAddr) -> Option<u32> {
+pub(crate) fn auth_probe_fail_streak_for_testing_in_shared(
+    shared: &ProxySharedState,
+    peer_ip: IpAddr,
+) -> Option<u32> {
     let peer_ip = normalize_auth_probe_ip(peer_ip);
-    let state = AUTH_PROBE_STATE.get()?;
-    state.get(&peer_ip).map(|entry| entry.fail_streak)
+    shared
+        .handshake
+        .auth_probe
+        .get(&peer_ip)
+        .map(|entry| entry.fail_streak)
 }
 
 #[cfg(test)]
-fn auth_probe_is_throttled_for_testing(peer_ip: IpAddr) -> bool {
-    auth_probe_is_throttled(peer_ip, Instant::now())
-}
-
-#[cfg(test)]
-fn auth_probe_saturation_is_throttled_for_testing() -> bool {
-    auth_probe_saturation_is_throttled(Instant::now())
-}
-
-#[cfg(test)]
-fn auth_probe_saturation_is_throttled_at_for_testing(now: Instant) -> bool {
-    auth_probe_saturation_is_throttled(now)
-}
-
-#[cfg(test)]
-fn auth_probe_test_lock() -> &'static Mutex<()> {
-    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-#[cfg(test)]
-fn unknown_sni_warn_test_lock() -> &'static Mutex<()> {
-    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-#[cfg(test)]
-fn clear_unknown_sni_warn_state_for_testing() {
-    if UNKNOWN_SNI_WARN_NEXT_ALLOWED.get().is_some() {
-        let mut guard = unknown_sni_warn_state_lock();
-        *guard = None;
+pub(crate) fn clear_auth_probe_state_for_testing_in_shared(shared: &ProxySharedState) {
+    shared.handshake.auth_probe.clear();
+    match shared.handshake.auth_probe_saturation.lock() {
+        Ok(mut saturation) => {
+            *saturation = None;
+        }
+        Err(poisoned) => {
+            let mut saturation = poisoned.into_inner();
+            *saturation = None;
+            shared.handshake.auth_probe_saturation.clear_poison();
+        }
     }
 }
 
-#[cfg(test)]
-fn should_emit_unknown_sni_warn_for_testing(now: Instant) -> bool {
-    should_emit_unknown_sni_warn(now)
-}
-
-#[cfg(test)]
-fn clear_warned_secrets_for_testing() {
-    if let Some(warned) = INVALID_SECRET_WARNED.get()
-        && let Ok(mut guard) = warned.lock()
-    {
-        guard.clear();
-    }
-}
-
-#[cfg(test)]
-fn warned_secrets_test_lock() -> &'static Mutex<()> {
-    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn warn_invalid_secret_once(name: &str, reason: &str, expected: usize, got: Option<usize>) {
+fn warn_invalid_secret_once_in(
+    shared: &ProxySharedState,
+    name: &str,
+    reason: &str,
+    expected: usize,
+    got: Option<usize>,
+) {
     let key = (name.to_string(), reason.to_string());
-    let warned = INVALID_SECRET_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-    let should_warn = match warned.lock() {
+    let should_warn = match shared.handshake.invalid_secret_warned.lock() {
         Ok(mut guard) => {
             if !guard.contains(&key) && guard.len() >= WARNED_SECRET_MAX_ENTRIES {
                 false
@@ -502,11 +786,12 @@ fn warn_invalid_secret_once(name: &str, reason: &str, expected: usize, got: Opti
     }
 }
 
-fn decode_user_secret(name: &str, secret_hex: &str) -> Option<Vec<u8>> {
+fn decode_user_secret(shared: &ProxySharedState, name: &str, secret_hex: &str) -> Option<Vec<u8>> {
     match hex::decode(secret_hex) {
         Ok(bytes) if bytes.len() == ACCESS_SECRET_BYTES => Some(bytes),
         Ok(bytes) => {
-            warn_invalid_secret_once(
+            warn_invalid_secret_once_in(
+                shared,
                 name,
                 "invalid_length",
                 ACCESS_SECRET_BYTES,
@@ -515,7 +800,7 @@ fn decode_user_secret(name: &str, secret_hex: &str) -> Option<Vec<u8>> {
             None
         }
         Err(_) => {
-            warn_invalid_secret_once(name, "invalid_hex", ACCESS_SECRET_BYTES, None);
+            warn_invalid_secret_once_in(shared, name, "invalid_hex", ACCESS_SECRET_BYTES, None);
             None
         }
     }
@@ -543,7 +828,8 @@ fn mode_enabled_for_proto(config: &ProxyConfig, proto_tag: ProtoTag, is_tls: boo
     }
 }
 
-fn decode_user_secrets(
+fn decode_user_secrets_in(
+    shared: &ProxySharedState,
     config: &ProxyConfig,
     preferred_user: Option<&str>,
 ) -> Vec<(String, Vec<u8>)> {
@@ -551,7 +837,7 @@ fn decode_user_secrets(
 
     if let Some(preferred) = preferred_user
         && let Some(secret_hex) = config.access.users.get(preferred)
-        && let Some(bytes) = decode_user_secret(preferred, secret_hex)
+        && let Some(bytes) = decode_user_secret(shared, preferred, secret_hex)
     {
         secrets.push((preferred.to_string(), bytes));
     }
@@ -560,12 +846,92 @@ fn decode_user_secrets(
         if preferred_user.is_some_and(|preferred| preferred == name.as_str()) {
             continue;
         }
-        if let Some(bytes) = decode_user_secret(name, secret_hex) {
+        if let Some(bytes) = decode_user_secret(shared, name, secret_hex) {
             secrets.push((name.clone(), bytes));
         }
     }
 
     secrets
+}
+
+#[cfg(test)]
+pub(crate) fn auth_probe_state_for_testing_in_shared(
+    shared: &ProxySharedState,
+) -> &DashMap<IpAddr, AuthProbeState> {
+    &shared.handshake.auth_probe
+}
+
+#[cfg(test)]
+pub(crate) fn auth_probe_saturation_state_for_testing_in_shared(
+    shared: &ProxySharedState,
+) -> &Mutex<Option<AuthProbeSaturationState>> {
+    &shared.handshake.auth_probe_saturation
+}
+
+#[cfg(test)]
+pub(crate) fn auth_probe_saturation_state_lock_for_testing_in_shared(
+    shared: &ProxySharedState,
+) -> std::sync::MutexGuard<'_, Option<AuthProbeSaturationState>> {
+    shared
+        .handshake
+        .auth_probe_saturation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn clear_unknown_sni_warn_state_for_testing_in_shared(shared: &ProxySharedState) {
+    let mut guard = shared
+        .handshake
+        .unknown_sni_warn_next_allowed
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn should_emit_unknown_sni_warn_for_testing_in_shared(
+    shared: &ProxySharedState,
+    now: Instant,
+) -> bool {
+    should_emit_unknown_sni_warn_in(shared, now)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_warned_secrets_for_testing_in_shared(shared: &ProxySharedState) {
+    if let Ok(mut guard) = shared.handshake.invalid_secret_warned.lock() {
+        guard.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn warned_secrets_for_testing_in_shared(
+    shared: &ProxySharedState,
+) -> &Mutex<HashSet<(String, String)>> {
+    &shared.handshake.invalid_secret_warned
+}
+
+#[cfg(test)]
+pub(crate) fn auth_probe_is_throttled_for_testing_in_shared(
+    shared: &ProxySharedState,
+    peer_ip: IpAddr,
+) -> bool {
+    auth_probe_is_throttled_in(shared, peer_ip, Instant::now())
+}
+
+#[cfg(test)]
+pub(crate) fn auth_probe_saturation_is_throttled_for_testing_in_shared(
+    shared: &ProxySharedState,
+) -> bool {
+    auth_probe_saturation_is_throttled_in(shared, Instant::now())
+}
+
+#[cfg(test)]
+pub(crate) fn auth_probe_saturation_is_throttled_at_for_testing_in_shared(
+    shared: &ProxySharedState,
+    now: Instant,
+) -> bool {
+    auth_probe_saturation_is_throttled_in(shared, now)
 }
 
 #[inline]
@@ -593,7 +959,7 @@ async fn maybe_apply_server_hello_delay(config: &ProxyConfig) {
     let delay_ms = if max == min {
         max
     } else {
-        rand::rng().random_range(min..=max)
+        crate::proxy::masking::sample_lognormal_percentile_bounded(min, max, &mut rand::rng())
     };
 
     if delay_ms > 0 {
@@ -635,6 +1001,7 @@ impl Drop for HandshakeSuccess {
 }
 
 /// Handle fake TLS handshake
+#[cfg(test)]
 pub async fn handle_tls_handshake<R, W>(
     handshake: &[u8],
     reader: R,
@@ -649,17 +1016,76 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let shared = ProxySharedState::new();
+    handle_tls_handshake_impl(
+        handshake,
+        reader,
+        writer,
+        peer,
+        config,
+        replay_checker,
+        rng,
+        tls_cache,
+        shared.as_ref(),
+    )
+    .await
+}
+
+pub async fn handle_tls_handshake_with_shared<R, W>(
+    handshake: &[u8],
+    reader: R,
+    writer: W,
+    peer: SocketAddr,
+    config: &ProxyConfig,
+    replay_checker: &ReplayChecker,
+    rng: &SecureRandom,
+    tls_cache: Option<Arc<TlsFrontCache>>,
+    shared: &ProxySharedState,
+) -> HandshakeResult<(FakeTlsReader<R>, FakeTlsWriter<W>, String), R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    handle_tls_handshake_impl(
+        handshake,
+        reader,
+        writer,
+        peer,
+        config,
+        replay_checker,
+        rng,
+        tls_cache,
+        shared,
+    )
+    .await
+}
+
+async fn handle_tls_handshake_impl<R, W>(
+    handshake: &[u8],
+    reader: R,
+    mut writer: W,
+    peer: SocketAddr,
+    config: &ProxyConfig,
+    replay_checker: &ReplayChecker,
+    rng: &SecureRandom,
+    tls_cache: Option<Arc<TlsFrontCache>>,
+    shared: &ProxySharedState,
+) -> HandshakeResult<(FakeTlsReader<R>, FakeTlsWriter<W>, String), R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     debug!(peer = %peer, handshake_len = handshake.len(), "Processing TLS handshake");
 
     let throttle_now = Instant::now();
-    if auth_probe_should_apply_preauth_throttle(peer.ip(), throttle_now) {
+    if auth_probe_should_apply_preauth_throttle_in(shared, peer.ip(), throttle_now) {
         maybe_apply_server_hello_delay(config).await;
         debug!(peer = %peer, "TLS handshake rejected by pre-auth probe throttle");
         return HandshakeResult::BadClient { reader, writer };
     }
 
     if handshake.len() < tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN + 1 {
-        auth_probe_record_failure(peer.ip(), Instant::now());
+        auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
         maybe_apply_server_hello_delay(config).await;
         debug!(peer = %peer, "TLS handshake too short");
         return HandshakeResult::BadClient { reader, writer };
@@ -695,70 +1121,282 @@ where
     };
 
     if client_sni.is_some() && matched_tls_domain.is_none() && preferred_user_hint.is_none() {
-        auth_probe_record_failure(peer.ip(), Instant::now());
-        maybe_apply_server_hello_delay(config).await;
         let sni = client_sni.as_deref().unwrap_or_default();
-        let log_now = Instant::now();
-        if should_emit_unknown_sni_warn(log_now) {
-            warn!(
-                peer = %peer,
-                sni = %sni,
-                unknown_sni = true,
-                unknown_sni_action = ?config.censorship.unknown_sni_action,
-                "TLS handshake rejected by unknown SNI policy"
-            );
-        } else {
-            info!(
-                peer = %peer,
-                sni = %sni,
-                unknown_sni = true,
-                unknown_sni_action = ?config.censorship.unknown_sni_action,
-                "TLS handshake rejected by unknown SNI policy"
-            );
+        match config.censorship.unknown_sni_action {
+            UnknownSniAction::Accept => {
+                debug!(
+                    peer = %peer,
+                    sni = %sni,
+                    unknown_sni = true,
+                    unknown_sni_action = ?config.censorship.unknown_sni_action,
+                    "TLS handshake accepted by unknown SNI policy"
+                );
+            }
+            action @ (UnknownSniAction::Drop | UnknownSniAction::Mask) => {
+                auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
+                maybe_apply_server_hello_delay(config).await;
+                let log_now = Instant::now();
+                if should_emit_unknown_sni_warn_in(shared, log_now) {
+                    warn!(
+                        peer = %peer,
+                        sni = %sni,
+                        unknown_sni = true,
+                        unknown_sni_action = ?action,
+                        "TLS handshake rejected by unknown SNI policy"
+                    );
+                } else {
+                    info!(
+                        peer = %peer,
+                        sni = %sni,
+                        unknown_sni = true,
+                        unknown_sni_action = ?action,
+                        "TLS handshake rejected by unknown SNI policy"
+                    );
+                }
+                return match action {
+                    UnknownSniAction::Drop => HandshakeResult::Error(ProxyError::UnknownTlsSni),
+                    UnknownSniAction::Mask => HandshakeResult::BadClient { reader, writer },
+                    UnknownSniAction::Accept => unreachable!(),
+                };
+            }
         }
-        return match config.censorship.unknown_sni_action {
-            UnknownSniAction::Drop => HandshakeResult::Error(ProxyError::UnknownTlsSni),
-            UnknownSniAction::Mask => HandshakeResult::BadClient { reader, writer },
-        };
     }
 
-    let secrets = decode_user_secrets(config, preferred_user_hint);
+    let mut validation_digest = [0u8; tls::TLS_DIGEST_LEN];
+    let mut validation_session_id = [0u8; 32];
+    let mut validation_session_id_len = 0usize;
+    let mut validated_user = String::new();
+    let mut validated_secret = [0u8; ACCESS_SECRET_BYTES];
+    let mut validated_user_id: Option<u32> = None;
 
-    let validation = match tls::validate_tls_handshake_with_replay_window(
-        handshake,
-        &secrets,
-        config.access.ignore_time_skew,
-        config.access.replay_window_secs,
-    ) {
-        Some(v) => v,
-        None => {
-            auth_probe_record_failure(peer.ip(), Instant::now());
+    if let Some(snapshot) = config.runtime_user_auth() {
+        let parsed = match parse_tls_auth_material(
+            handshake,
+            config.access.ignore_time_skew,
+            config.access.replay_window_secs,
+        ) {
+            Some(parsed) => parsed,
+            None => {
+                auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
+                maybe_apply_server_hello_delay(config).await;
+                debug!(peer = %peer, "TLS handshake auth material parsing failed");
+                return HandshakeResult::BadClient { reader, writer };
+            }
+        };
+
+        let sticky_ip_hint = sticky_hint_get_by_ip(shared, peer.ip());
+        let preferred_user_id = preferred_user_hint.and_then(|user| snapshot.user_id_by_name(user));
+        let sticky_sni_hint = client_sni
+            .as_deref()
+            .and_then(|sni| sticky_hint_get_by_sni(shared, sni));
+        let sticky_prefix_hint = sticky_hint_get_by_ip_prefix(shared, peer.ip());
+        let sni_candidates = client_sni
+            .as_deref()
+            .and_then(|sni| snapshot.sni_candidates(sni));
+        let sni_initial_candidates = client_sni
+            .as_deref()
+            .and_then(|sni| snapshot.sni_initial_candidates(sni));
+
+        let has_hint = sticky_ip_hint.is_some()
+            || preferred_user_id.is_some()
+            || sticky_sni_hint.is_some()
+            || sticky_prefix_hint.is_some()
+            || sni_candidates.is_some_and(|ids| !ids.is_empty())
+            || sni_initial_candidates.is_some_and(|ids| !ids.is_empty());
+        let overload = auth_probe_saturation_is_throttled_in(shared, Instant::now());
+        let candidate_budget = budget_for_validation(snapshot.entries().len(), overload, has_hint);
+
+        let mut tried_user_ids = [u32::MAX; CANDIDATE_HINT_TRACK_CAP];
+        let mut tried_len = 0usize;
+        let mut validation_checks = 0usize;
+        let mut budget_exhausted = false;
+
+        macro_rules! try_user_id {
+            ($user_id:expr) => {{
+                if validation_checks >= candidate_budget {
+                    budget_exhausted = true;
+                    false
+                } else if !mark_candidate_if_new(&mut tried_user_ids, &mut tried_len, $user_id) {
+                    false
+                } else if let Some(entry) = snapshot.entry_by_id($user_id) {
+                    validation_checks = validation_checks.saturating_add(1);
+                    if let Some(candidate) =
+                        validate_tls_secret_candidate(&parsed, handshake, &entry.secret)
+                    {
+                        validation_digest = candidate.digest;
+                        validation_session_id = candidate.session_id;
+                        validation_session_id_len = candidate.session_id_len;
+                        validated_secret.copy_from_slice(&entry.secret);
+                        validated_user = entry.user.clone();
+                        validated_user_id = Some($user_id);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }};
+        }
+
+        let mut matched = false;
+        if let Some(user_id) = sticky_ip_hint {
+            matched = try_user_id!(user_id);
+        }
+
+        if !matched && let Some(user_id) = preferred_user_id {
+            matched = try_user_id!(user_id);
+        }
+
+        if !matched && let Some(user_id) = sticky_sni_hint {
+            matched = try_user_id!(user_id);
+        }
+
+        if !matched && let Some(user_id) = sticky_prefix_hint {
+            matched = try_user_id!(user_id);
+        }
+
+        if !matched
+            && !budget_exhausted
+            && let Some(candidate_ids) = sni_candidates
+        {
+            for &user_id in candidate_ids {
+                if try_user_id!(user_id) {
+                    matched = true;
+                    break;
+                }
+                if budget_exhausted {
+                    break;
+                }
+            }
+        }
+
+        if !matched
+            && !budget_exhausted
+            && let Some(candidate_ids) = sni_initial_candidates
+        {
+            for &user_id in candidate_ids {
+                if try_user_id!(user_id) {
+                    matched = true;
+                    break;
+                }
+                if budget_exhausted {
+                    break;
+                }
+            }
+        }
+
+        if !matched && !budget_exhausted {
+            let ring = &shared.handshake.recent_user_ring;
+            if !ring.is_empty() {
+                let next_seq = shared
+                    .handshake
+                    .recent_user_ring_seq
+                    .load(Ordering::Relaxed);
+                let scan_limit = ring.len().min(RECENT_USER_RING_SCAN_LIMIT);
+                for offset in 0..scan_limit {
+                    let idx = (next_seq as usize + ring.len() - 1 - offset) % ring.len();
+                    let encoded_user_id = ring[idx].load(Ordering::Relaxed);
+                    if encoded_user_id == 0 {
+                        continue;
+                    }
+                    if try_user_id!(encoded_user_id - 1) {
+                        matched = true;
+                        break;
+                    }
+                    if budget_exhausted {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !matched && !budget_exhausted {
+            for idx in 0..snapshot.entries().len() {
+                let Some(user_id) = u32::try_from(idx).ok() else {
+                    break;
+                };
+                if try_user_id!(user_id) {
+                    matched = true;
+                    break;
+                }
+                if budget_exhausted {
+                    break;
+                }
+            }
+        }
+
+        shared
+            .handshake
+            .auth_expensive_checks_total
+            .fetch_add(validation_checks as u64, Ordering::Relaxed);
+        if budget_exhausted {
+            shared
+                .handshake
+                .auth_budget_exhausted_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        if !matched {
+            auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
             maybe_apply_server_hello_delay(config).await;
             debug!(
                 peer = %peer,
                 ignore_time_skew = config.access.ignore_time_skew,
-                "TLS handshake validation failed - no matching user or time skew"
+                budget_exhausted = budget_exhausted,
+                candidate_budget = candidate_budget,
+                validation_checks = validation_checks,
+                "TLS handshake validation failed - no matching user, time skew, or budget exhausted"
             );
             return HandshakeResult::BadClient { reader, writer };
         }
-    };
+    } else {
+        let secrets = decode_user_secrets_in(shared, config, preferred_user_hint);
+        let validation = match tls::validate_tls_handshake_with_replay_window(
+            handshake,
+            &secrets,
+            config.access.ignore_time_skew,
+            config.access.replay_window_secs,
+        ) {
+            Some(v) => v,
+            None => {
+                auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
+                maybe_apply_server_hello_delay(config).await;
+                debug!(
+                    peer = %peer,
+                    ignore_time_skew = config.access.ignore_time_skew,
+                    "TLS handshake validation failed - no matching user or time skew"
+                );
+                return HandshakeResult::BadClient { reader, writer };
+            }
+        };
+        let secret = match secrets.iter().find(|(name, _)| *name == validation.user) {
+            Some((_, s)) if s.len() == ACCESS_SECRET_BYTES => s,
+            _ => {
+                maybe_apply_server_hello_delay(config).await;
+                return HandshakeResult::BadClient { reader, writer };
+            }
+        };
+
+        validation_digest = validation.digest;
+        validation_session_id_len = validation.session_id.len();
+        if validation_session_id_len > validation_session_id.len() {
+            maybe_apply_server_hello_delay(config).await;
+            return HandshakeResult::BadClient { reader, writer };
+        }
+        validation_session_id[..validation_session_id_len].copy_from_slice(&validation.session_id);
+        validated_user = validation.user;
+        validated_secret.copy_from_slice(secret);
+    }
 
     // Reject known replay digests before expensive cache/domain/ALPN policy work.
-    let digest_half = &validation.digest[..tls::TLS_DIGEST_HALF_LEN];
+    let digest_half = &validation_digest[..tls::TLS_DIGEST_HALF_LEN];
     if replay_checker.check_tls_digest(digest_half) {
-        auth_probe_record_failure(peer.ip(), Instant::now());
+        auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
         maybe_apply_server_hello_delay(config).await;
         warn!(peer = %peer, "TLS replay attack detected (duplicate digest)");
         return HandshakeResult::BadClient { reader, writer };
     }
-
-    let secret = match secrets.iter().find(|(name, _)| *name == validation.user) {
-        Some((_, s)) => s,
-        None => {
-            maybe_apply_server_hello_delay(config).await;
-            return HandshakeResult::BadClient { reader, writer };
-        }
-    };
 
     let cached = if config.censorship.tls_emulation {
         if let Some(cache) = tls_cache.as_ref() {
@@ -782,11 +1420,13 @@ where
     // Add replay digest only for policy-valid handshakes.
     replay_checker.add_tls_digest(digest_half);
 
+    let validation_session_id_slice = &validation_session_id[..validation_session_id_len];
+
     let response = if let Some((cached_entry, use_full_cert_payload)) = cached {
         emulator::build_emulated_server_hello(
-            secret,
-            &validation.digest,
-            &validation.session_id,
+            &validated_secret,
+            &validation_digest,
+            validation_session_id_slice,
             &cached_entry,
             use_full_cert_payload,
             rng,
@@ -795,9 +1435,9 @@ where
         )
     } else {
         tls::build_server_hello(
-            secret,
-            &validation.digest,
-            &validation.session_id,
+            &validated_secret,
+            &validation_digest,
+            validation_session_id_slice,
             config.censorship.fake_cert_len,
             rng,
             selected_alpn.clone(),
@@ -823,20 +1463,26 @@ where
 
     debug!(
         peer = %peer,
-        user = %validation.user,
+        user = %validated_user,
         "TLS handshake successful"
     );
 
-    auth_probe_record_success(peer.ip());
+    auth_probe_record_success_in(shared, peer.ip());
+
+    if let Some(user_id) = validated_user_id {
+        sticky_hint_record_success_in(shared, peer.ip(), user_id, client_sni.as_deref());
+        record_recent_user_success_in(shared, user_id);
+    }
 
     HandshakeResult::Success((
         FakeTlsReader::new(reader),
         FakeTlsWriter::new(writer),
-        validation.user,
+        validated_user,
     ))
 }
 
 /// Handle MTProto obfuscation handshake
+#[cfg(test)]
 pub async fn handle_mtproto_handshake<R, W>(
     handshake: &[u8; HANDSHAKE_LEN],
     reader: R,
@@ -846,6 +1492,65 @@ pub async fn handle_mtproto_handshake<R, W>(
     replay_checker: &ReplayChecker,
     is_tls: bool,
     preferred_user: Option<&str>,
+) -> HandshakeResult<(CryptoReader<R>, CryptoWriter<W>, HandshakeSuccess), R, W>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let shared = ProxySharedState::new();
+    handle_mtproto_handshake_impl(
+        handshake,
+        reader,
+        writer,
+        peer,
+        config,
+        replay_checker,
+        is_tls,
+        preferred_user,
+        shared.as_ref(),
+    )
+    .await
+}
+
+pub async fn handle_mtproto_handshake_with_shared<R, W>(
+    handshake: &[u8; HANDSHAKE_LEN],
+    reader: R,
+    writer: W,
+    peer: SocketAddr,
+    config: &ProxyConfig,
+    replay_checker: &ReplayChecker,
+    is_tls: bool,
+    preferred_user: Option<&str>,
+    shared: &ProxySharedState,
+) -> HandshakeResult<(CryptoReader<R>, CryptoWriter<W>, HandshakeSuccess), R, W>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    handle_mtproto_handshake_impl(
+        handshake,
+        reader,
+        writer,
+        peer,
+        config,
+        replay_checker,
+        is_tls,
+        preferred_user,
+        shared,
+    )
+    .await
+}
+
+async fn handle_mtproto_handshake_impl<R, W>(
+    handshake: &[u8; HANDSHAKE_LEN],
+    reader: R,
+    writer: W,
+    peer: SocketAddr,
+    config: &ProxyConfig,
+    replay_checker: &ReplayChecker,
+    is_tls: bool,
+    preferred_user: Option<&str>,
+    shared: &ProxySharedState,
 ) -> HandshakeResult<(CryptoReader<R>, CryptoWriter<W>, HandshakeSuccess), R, W>
 where
     R: AsyncRead + Unpin + Send,
@@ -862,68 +1567,157 @@ where
     );
 
     let throttle_now = Instant::now();
-    if auth_probe_should_apply_preauth_throttle(peer.ip(), throttle_now) {
+    if auth_probe_should_apply_preauth_throttle_in(shared, peer.ip(), throttle_now) {
         maybe_apply_server_hello_delay(config).await;
         debug!(peer = %peer, "MTProto handshake rejected by pre-auth probe throttle");
         return HandshakeResult::BadClient { reader, writer };
     }
 
     let dec_prekey_iv = &handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN];
+    let mut dec_prekey = [0u8; PREKEY_LEN];
+    dec_prekey.copy_from_slice(&dec_prekey_iv[..PREKEY_LEN]);
+    let mut dec_iv_arr = [0u8; IV_LEN];
+    dec_iv_arr.copy_from_slice(&dec_prekey_iv[PREKEY_LEN..]);
+    let dec_iv = u128::from_be_bytes(dec_iv_arr);
 
-    let enc_prekey_iv: Vec<u8> = dec_prekey_iv.iter().rev().copied().collect();
+    let mut enc_prekey_iv = [0u8; PREKEY_LEN + IV_LEN];
+    for idx in 0..enc_prekey_iv.len() {
+        enc_prekey_iv[idx] = dec_prekey_iv[dec_prekey_iv.len() - 1 - idx];
+    }
+    let mut enc_prekey = [0u8; PREKEY_LEN];
+    enc_prekey.copy_from_slice(&enc_prekey_iv[..PREKEY_LEN]);
+    let mut enc_iv_arr = [0u8; IV_LEN];
+    enc_iv_arr.copy_from_slice(&enc_prekey_iv[PREKEY_LEN..]);
+    let enc_iv = u128::from_be_bytes(enc_iv_arr);
 
-    let decoded_users = decode_user_secrets(config, preferred_user);
+    if let Some(snapshot) = config.runtime_user_auth() {
+        let sticky_ip_hint = sticky_hint_get_by_ip(shared, peer.ip());
+        let sticky_prefix_hint = sticky_hint_get_by_ip_prefix(shared, peer.ip());
+        let preferred_user_id = preferred_user.and_then(|user| snapshot.user_id_by_name(user));
+        let has_hint =
+            sticky_ip_hint.is_some() || sticky_prefix_hint.is_some() || preferred_user_id.is_some();
+        let overload = auth_probe_saturation_is_throttled_in(shared, Instant::now());
+        let candidate_budget = budget_for_validation(snapshot.entries().len(), overload, has_hint);
 
-    for (user, secret) in decoded_users {
-        let dec_prekey = &dec_prekey_iv[..PREKEY_LEN];
-        let dec_iv_bytes = &dec_prekey_iv[PREKEY_LEN..];
+        let mut tried_user_ids = [u32::MAX; CANDIDATE_HINT_TRACK_CAP];
+        let mut tried_len = 0usize;
+        let mut validation_checks = 0usize;
+        let mut budget_exhausted = false;
 
-        let mut dec_key_input = Zeroizing::new(Vec::with_capacity(PREKEY_LEN + secret.len()));
-        dec_key_input.extend_from_slice(dec_prekey);
-        dec_key_input.extend_from_slice(&secret);
-        let dec_key = Zeroizing::new(sha256(&dec_key_input));
+        let mut matched_user = String::new();
+        let mut matched_user_id = None;
+        let mut matched_validation = None;
 
-        let mut dec_iv_arr = [0u8; IV_LEN];
-        dec_iv_arr.copy_from_slice(dec_iv_bytes);
-        let dec_iv = u128::from_be_bytes(dec_iv_arr);
-
-        let mut decryptor = AesCtr::new(&dec_key, dec_iv);
-        let decrypted = decryptor.decrypt(handshake);
-
-        let tag_bytes: [u8; 4] = [
-            decrypted[PROTO_TAG_POS],
-            decrypted[PROTO_TAG_POS + 1],
-            decrypted[PROTO_TAG_POS + 2],
-            decrypted[PROTO_TAG_POS + 3],
-        ];
-
-        let proto_tag = match ProtoTag::from_bytes(tag_bytes) {
-            Some(tag) => tag,
-            None => continue,
-        };
-
-        let mode_ok = mode_enabled_for_proto(config, proto_tag, is_tls);
-
-        if !mode_ok {
-            debug!(peer = %peer, user = %user, proto = ?proto_tag, "Mode not enabled");
-            continue;
+        macro_rules! try_user_id {
+            ($user_id:expr) => {{
+                if validation_checks >= candidate_budget {
+                    budget_exhausted = true;
+                    false
+                } else if !mark_candidate_if_new(&mut tried_user_ids, &mut tried_len, $user_id) {
+                    false
+                } else if let Some(entry) = snapshot.entry_by_id($user_id) {
+                    validation_checks = validation_checks.saturating_add(1);
+                    if let Some(validation) = validate_mtproto_secret_candidate(
+                        handshake,
+                        &dec_prekey,
+                        dec_iv,
+                        &enc_prekey,
+                        enc_iv,
+                        &entry.secret,
+                        config,
+                        is_tls,
+                    ) {
+                        matched_user = entry.user.clone();
+                        matched_user_id = Some($user_id);
+                        matched_validation = Some(validation);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }};
         }
 
-        let dc_idx = i16::from_le_bytes([decrypted[DC_IDX_POS], decrypted[DC_IDX_POS + 1]]);
+        let mut matched = false;
+        if let Some(user_id) = sticky_ip_hint {
+            matched = try_user_id!(user_id);
+        }
 
-        let enc_prekey = &enc_prekey_iv[..PREKEY_LEN];
-        let enc_iv_bytes = &enc_prekey_iv[PREKEY_LEN..];
+        if !matched && let Some(user_id) = preferred_user_id {
+            matched = try_user_id!(user_id);
+        }
 
-        let mut enc_key_input = Zeroizing::new(Vec::with_capacity(PREKEY_LEN + secret.len()));
-        enc_key_input.extend_from_slice(enc_prekey);
-        enc_key_input.extend_from_slice(&secret);
-        let enc_key = Zeroizing::new(sha256(&enc_key_input));
+        if !matched && let Some(user_id) = sticky_prefix_hint {
+            matched = try_user_id!(user_id);
+        }
 
-        let mut enc_iv_arr = [0u8; IV_LEN];
-        enc_iv_arr.copy_from_slice(enc_iv_bytes);
-        let enc_iv = u128::from_be_bytes(enc_iv_arr);
+        if !matched && !budget_exhausted {
+            let ring = &shared.handshake.recent_user_ring;
+            if !ring.is_empty() {
+                let next_seq = shared
+                    .handshake
+                    .recent_user_ring_seq
+                    .load(Ordering::Relaxed);
+                let scan_limit = ring.len().min(RECENT_USER_RING_SCAN_LIMIT);
+                for offset in 0..scan_limit {
+                    let idx = (next_seq as usize + ring.len() - 1 - offset) % ring.len();
+                    let encoded_user_id = ring[idx].load(Ordering::Relaxed);
+                    if encoded_user_id == 0 {
+                        continue;
+                    }
+                    if try_user_id!(encoded_user_id - 1) {
+                        matched = true;
+                        break;
+                    }
+                    if budget_exhausted {
+                        break;
+                    }
+                }
+            }
+        }
 
-        let encryptor = AesCtr::new(&enc_key, enc_iv);
+        if !matched && !budget_exhausted {
+            for idx in 0..snapshot.entries().len() {
+                let Some(user_id) = u32::try_from(idx).ok() else {
+                    break;
+                };
+                if try_user_id!(user_id) {
+                    matched = true;
+                    break;
+                }
+                if budget_exhausted {
+                    break;
+                }
+            }
+        }
+
+        shared
+            .handshake
+            .auth_expensive_checks_total
+            .fetch_add(validation_checks as u64, Ordering::Relaxed);
+        if budget_exhausted {
+            shared
+                .handshake
+                .auth_budget_exhausted_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        if !matched {
+            auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
+            maybe_apply_server_hello_delay(config).await;
+            debug!(
+                peer = %peer,
+                budget_exhausted = budget_exhausted,
+                candidate_budget = candidate_budget,
+                validation_checks = validation_checks,
+                "MTProto handshake: no matching user found"
+            );
+            return HandshakeResult::BadClient { reader, writer };
+        }
+
+        let validation = matched_validation.expect("validation must exist when matched");
 
         // Apply replay tracking only after successful authentication.
         //
@@ -932,44 +1726,130 @@ where
         // entry from the cache. We accept the cost of performing the full
         // authentication check first to avoid poisoning the replay cache.
         if replay_checker.check_and_add_handshake(dec_prekey_iv) {
-            auth_probe_record_failure(peer.ip(), Instant::now());
+            auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
             maybe_apply_server_hello_delay(config).await;
-            warn!(peer = %peer, user = %user, "MTProto replay attack detected");
+            warn!(peer = %peer, user = %matched_user, "MTProto replay attack detected");
             return HandshakeResult::BadClient { reader, writer };
         }
 
+        let dec_key = Zeroizing::new(validation.dec_key);
+        let enc_key = Zeroizing::new(validation.enc_key);
         let success = HandshakeSuccess {
-            user: user.clone(),
-            dc_idx,
-            proto_tag,
+            user: matched_user.clone(),
+            dc_idx: validation.dc_idx,
+            proto_tag: validation.proto_tag,
             dec_key: *dec_key,
-            dec_iv,
+            dec_iv: validation.dec_iv,
             enc_key: *enc_key,
-            enc_iv,
+            enc_iv: validation.enc_iv,
             peer,
             is_tls,
         };
 
         debug!(
             peer = %peer,
-            user = %user,
-            dc = dc_idx,
-            proto = ?proto_tag,
+            user = %matched_user,
+            dc = validation.dc_idx,
+            proto = ?validation.proto_tag,
             tls = is_tls,
             "MTProto handshake successful"
         );
 
-        auth_probe_record_success(peer.ip());
+        auth_probe_record_success_in(shared, peer.ip());
+        if let Some(user_id) = matched_user_id {
+            sticky_hint_record_success_in(shared, peer.ip(), user_id, None);
+            record_recent_user_success_in(shared, user_id);
+        }
 
         let max_pending = config.general.crypto_pending_buffer;
         return HandshakeResult::Success((
-            CryptoReader::new(reader, decryptor),
-            CryptoWriter::new(writer, encryptor, max_pending),
+            CryptoReader::new(reader, validation.decryptor),
+            CryptoWriter::new(writer, validation.encryptor, max_pending),
             success,
         ));
+    } else {
+        let decoded_users = decode_user_secrets_in(shared, config, preferred_user);
+        let mut validation_checks = 0usize;
+
+        for (user, secret) in decoded_users {
+            if secret.len() != ACCESS_SECRET_BYTES {
+                continue;
+            }
+            validation_checks = validation_checks.saturating_add(1);
+
+            let mut secret_arr = [0u8; ACCESS_SECRET_BYTES];
+            secret_arr.copy_from_slice(&secret);
+            let Some(validation) = validate_mtproto_secret_candidate(
+                handshake,
+                &dec_prekey,
+                dec_iv,
+                &enc_prekey,
+                enc_iv,
+                &secret_arr,
+                config,
+                is_tls,
+            ) else {
+                continue;
+            };
+
+            shared
+                .handshake
+                .auth_expensive_checks_total
+                .fetch_add(validation_checks as u64, Ordering::Relaxed);
+
+            // Apply replay tracking only after successful authentication.
+            //
+            // This ordering prevents an attacker from producing invalid handshakes that
+            // still collide with a valid handshake's replay slot and thus evict a valid
+            // entry from the cache. We accept the cost of performing the full
+            // authentication check first to avoid poisoning the replay cache.
+            if replay_checker.check_and_add_handshake(dec_prekey_iv) {
+                auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
+                maybe_apply_server_hello_delay(config).await;
+                warn!(peer = %peer, user = %user, "MTProto replay attack detected");
+                return HandshakeResult::BadClient { reader, writer };
+            }
+
+            let dec_key = Zeroizing::new(validation.dec_key);
+            let enc_key = Zeroizing::new(validation.enc_key);
+            let success = HandshakeSuccess {
+                user: user.clone(),
+                dc_idx: validation.dc_idx,
+                proto_tag: validation.proto_tag,
+                dec_key: *dec_key,
+                dec_iv: validation.dec_iv,
+                enc_key: *enc_key,
+                enc_iv: validation.enc_iv,
+                peer,
+                is_tls,
+            };
+
+            debug!(
+                peer = %peer,
+                user = %user,
+                dc = validation.dc_idx,
+                proto = ?validation.proto_tag,
+                tls = is_tls,
+                "MTProto handshake successful"
+            );
+
+            auth_probe_record_success_in(shared, peer.ip());
+
+            let max_pending = config.general.crypto_pending_buffer;
+            return HandshakeResult::Success((
+                CryptoReader::new(reader, validation.decryptor),
+                CryptoWriter::new(writer, validation.encryptor, max_pending),
+                success,
+            ));
+        }
+
+        shared
+            .handshake
+            .auth_expensive_checks_total
+            .fetch_add(validation_checks as u64, Ordering::Relaxed);
     }
 
-    auth_probe_record_failure(peer.ip(), Instant::now());
+    auth_probe_record_failure_in(shared, peer.ip(), Instant::now());
     maybe_apply_server_hello_delay(config).await;
     debug!(peer = %peer, "MTProto handshake: no matching user found");
     HandshakeResult::BadClient { reader, writer }
@@ -1122,6 +2002,10 @@ mod timing_manual_bench_tests;
 #[cfg(test)]
 #[path = "tests/handshake_key_material_zeroization_security_tests.rs"]
 mod handshake_key_material_zeroization_security_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_baseline_invariant_tests.rs"]
+mod handshake_baseline_invariant_tests;
 
 /// Compile-time guard: HandshakeSuccess holds cryptographic key material and
 /// must never be Copy.  A Copy impl would allow silent key duplication,

@@ -13,6 +13,7 @@ use crate::crypto::SecureRandom;
 use crate::ip_tracker::UserIpTracker;
 use crate::metrics;
 use crate::network::probe::NetworkProbe;
+use crate::proxy::shared_state::ProxySharedState;
 use crate::startup::{
     COMPONENT_CONFIG_WATCHER_START, COMPONENT_METRICS_START, COMPONENT_RUNTIME_READY,
     StartupTracker,
@@ -287,6 +288,7 @@ pub(crate) async fn spawn_metrics_if_configured(
     startup_tracker: &Arc<StartupTracker>,
     stats: Arc<Stats>,
     beobachten: Arc<BeobachtenStore>,
+    shared_state: Arc<ProxySharedState>,
     ip_tracker: Arc<UserIpTracker>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
 ) {
@@ -320,6 +322,7 @@ pub(crate) async fn spawn_metrics_if_configured(
             .await;
         let stats = stats.clone();
         let beobachten = beobachten.clone();
+        let shared_state = shared_state.clone();
         let config_rx_metrics = config_rx.clone();
         let ip_tracker_metrics = ip_tracker.clone();
         let whitelist = config.server.metrics_whitelist.clone();
@@ -331,6 +334,7 @@ pub(crate) async fn spawn_metrics_if_configured(
                 listen_backlog,
                 stats,
                 beobachten,
+                shared_state,
                 ip_tracker_metrics,
                 config_rx_metrics,
                 whitelist,

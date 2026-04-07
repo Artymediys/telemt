@@ -70,6 +70,7 @@ use tracing::{debug, trace, warn};
 ///
 /// iOS keeps Telegram connections alive in background for up to 30 minutes.
 /// Closing earlier causes unnecessary reconnects and handshake overhead.
+#[allow(dead_code)]
 const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Watchdog check interval — also used for periodic rate logging.
@@ -269,6 +270,7 @@ const QUOTA_NEAR_LIMIT_BYTES: u64 = 64 * 1024;
 const QUOTA_LARGE_CHARGE_BYTES: u64 = 16 * 1024;
 const QUOTA_ADAPTIVE_INTERVAL_MIN_BYTES: u64 = 4 * 1024;
 const QUOTA_ADAPTIVE_INTERVAL_MAX_BYTES: u64 = 64 * 1024;
+const QUOTA_RESERVE_SPIN_RETRIES: usize = 64;
 
 #[inline]
 fn quota_adaptive_interval_bytes(remaining_before: u64) -> u64 {
@@ -313,6 +315,50 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
                 if n > 0 {
                     let n_to_charge = n as u64;
 
+                    if let (Some(limit), Some(remaining)) = (this.quota_limit, remaining_before) {
+                        let mut reserved_total = None;
+                        let mut reserve_rounds = 0usize;
+                        while reserved_total.is_none() {
+                            for _ in 0..QUOTA_RESERVE_SPIN_RETRIES {
+                                match this.user_stats.quota_try_reserve(n_to_charge, limit) {
+                                    Ok(total) => {
+                                        reserved_total = Some(total);
+                                        break;
+                                    }
+                                    Err(crate::stats::QuotaReserveError::LimitExceeded) => {
+                                        this.quota_exceeded.store(true, Ordering::Release);
+                                        buf.set_filled(before);
+                                        return Poll::Ready(Err(quota_io_error()));
+                                    }
+                                    Err(crate::stats::QuotaReserveError::Contended) => {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                            }
+                            reserve_rounds = reserve_rounds.saturating_add(1);
+                            if reserved_total.is_none() && reserve_rounds >= 8 {
+                                this.quota_exceeded.store(true, Ordering::Release);
+                                buf.set_filled(before);
+                                return Poll::Ready(Err(quota_io_error()));
+                            }
+                        }
+
+                        if should_immediate_quota_check(remaining, n_to_charge) {
+                            this.quota_bytes_since_check = 0;
+                        } else {
+                            this.quota_bytes_since_check =
+                                this.quota_bytes_since_check.saturating_add(n_to_charge);
+                            let interval = quota_adaptive_interval_bytes(remaining);
+                            if this.quota_bytes_since_check >= interval {
+                                this.quota_bytes_since_check = 0;
+                            }
+                        }
+
+                        if reserved_total.unwrap_or(0) >= limit {
+                            this.quota_exceeded.store(true, Ordering::Release);
+                        }
+                    }
+
                     // C→S: client sent data
                     this.counters
                         .c2s_bytes
@@ -324,27 +370,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
                         .add_user_octets_from_handle(this.user_stats.as_ref(), n_to_charge);
                     this.stats
                         .increment_user_msgs_from_handle(this.user_stats.as_ref());
-
-                    if let (Some(limit), Some(remaining)) = (this.quota_limit, remaining_before) {
-                        this.stats
-                            .quota_charge_post_write(this.user_stats.as_ref(), n_to_charge);
-                        if should_immediate_quota_check(remaining, n_to_charge) {
-                            this.quota_bytes_since_check = 0;
-                            if this.user_stats.quota_used() >= limit {
-                                this.quota_exceeded.store(true, Ordering::Release);
-                            }
-                        } else {
-                            this.quota_bytes_since_check =
-                                this.quota_bytes_since_check.saturating_add(n_to_charge);
-                            let interval = quota_adaptive_interval_bytes(remaining);
-                            if this.quota_bytes_since_check >= interval {
-                                this.quota_bytes_since_check = 0;
-                                if this.user_stats.quota_used() >= limit {
-                                    this.quota_exceeded.store(true, Ordering::Release);
-                                }
-                            }
-                        }
-                    }
 
                     trace!(user = %this.user, bytes = n, "C->S");
                 }
@@ -367,18 +392,73 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
         }
 
         let mut remaining_before = None;
+        let mut reserved_bytes = 0u64;
+        let mut write_buf = buf;
         if let Some(limit) = this.quota_limit {
-            let used_before = this.user_stats.quota_used();
-            let remaining = limit.saturating_sub(used_before);
-            if remaining == 0 {
-                this.quota_exceeded.store(true, Ordering::Release);
-                return Poll::Ready(Err(quota_io_error()));
+            if !buf.is_empty() {
+                let mut reserve_rounds = 0usize;
+                while reserved_bytes == 0 {
+                    let used_before = this.user_stats.quota_used();
+                    let remaining = limit.saturating_sub(used_before);
+                    if remaining == 0 {
+                        this.quota_exceeded.store(true, Ordering::Release);
+                        return Poll::Ready(Err(quota_io_error()));
+                    }
+                    remaining_before = Some(remaining);
+
+                    let desired = remaining.min(buf.len() as u64);
+                    for _ in 0..QUOTA_RESERVE_SPIN_RETRIES {
+                        match this.user_stats.quota_try_reserve(desired, limit) {
+                            Ok(_) => {
+                                reserved_bytes = desired;
+                                write_buf = &buf[..desired as usize];
+                                break;
+                            }
+                            Err(crate::stats::QuotaReserveError::LimitExceeded) => {
+                                break;
+                            }
+                            Err(crate::stats::QuotaReserveError::Contended) => {
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
+
+                    reserve_rounds = reserve_rounds.saturating_add(1);
+                    if reserved_bytes == 0 && reserve_rounds >= 8 {
+                        this.quota_exceeded.store(true, Ordering::Release);
+                        return Poll::Ready(Err(quota_io_error()));
+                    }
+                }
+            } else {
+                let used_before = this.user_stats.quota_used();
+                let remaining = limit.saturating_sub(used_before);
+                if remaining == 0 {
+                    this.quota_exceeded.store(true, Ordering::Release);
+                    return Poll::Ready(Err(quota_io_error()));
+                }
+                remaining_before = Some(remaining);
             }
-            remaining_before = Some(remaining);
         }
 
-        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+        match Pin::new(&mut this.inner).poll_write(cx, write_buf) {
             Poll::Ready(Ok(n)) => {
+                if reserved_bytes > n as u64 {
+                    let refund = reserved_bytes - n as u64;
+                    let mut current = this.user_stats.quota_used.load(Ordering::Relaxed);
+                    loop {
+                        let next = current.saturating_sub(refund);
+                        match this.user_stats.quota_used.compare_exchange_weak(
+                            current,
+                            next,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(observed) => current = observed,
+                        }
+                    }
+                }
+
                 if n > 0 {
                     let n_to_charge = n as u64;
 
@@ -395,8 +475,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
                         .increment_user_msgs_to_handle(this.user_stats.as_ref());
 
                     if let (Some(limit), Some(remaining)) = (this.quota_limit, remaining_before) {
-                        this.stats
-                            .quota_charge_post_write(this.user_stats.as_ref(), n_to_charge);
                         if should_immediate_quota_check(remaining, n_to_charge) {
                             this.quota_bytes_since_check = 0;
                             if this.user_stats.quota_used() >= limit {
@@ -419,7 +497,42 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
                 }
                 Poll::Ready(Ok(n))
             }
-            other => other,
+            Poll::Ready(Err(err)) => {
+                if reserved_bytes > 0 {
+                    let mut current = this.user_stats.quota_used.load(Ordering::Relaxed);
+                    loop {
+                        let next = current.saturating_sub(reserved_bytes);
+                        match this.user_stats.quota_used.compare_exchange_weak(
+                            current,
+                            next,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(observed) => current = observed,
+                        }
+                    }
+                }
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => {
+                if reserved_bytes > 0 {
+                    let mut current = this.user_stats.quota_used.load(Ordering::Relaxed);
+                    loop {
+                        let next = current.saturating_sub(reserved_bytes);
+                        match this.user_stats.quota_used.compare_exchange_weak(
+                            current,
+                            next,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(observed) => current = observed,
+                        }
+                    }
+                }
+                Poll::Pending
+            }
         }
     }
 
@@ -453,6 +566,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
 /// - Clean shutdown: both write sides are shut down on exit
 /// - Error propagation: quota exits return `ProxyError::DataQuotaExceeded`,
 ///   other I/O failures are returned as `ProxyError::Io`
+#[allow(dead_code)]
 pub async fn relay_bidirectional<CR, CW, SR, SW>(
     client_reader: CR,
     client_writer: CW,
@@ -471,6 +585,42 @@ where
     SR: AsyncRead + Unpin + Send + 'static,
     SW: AsyncWrite + Unpin + Send + 'static,
 {
+    relay_bidirectional_with_activity_timeout(
+        client_reader,
+        client_writer,
+        server_reader,
+        server_writer,
+        c2s_buf_size,
+        s2c_buf_size,
+        user,
+        stats,
+        quota_limit,
+        _buffer_pool,
+        ACTIVITY_TIMEOUT,
+    )
+    .await
+}
+
+pub async fn relay_bidirectional_with_activity_timeout<CR, CW, SR, SW>(
+    client_reader: CR,
+    client_writer: CW,
+    server_reader: SR,
+    server_writer: SW,
+    c2s_buf_size: usize,
+    s2c_buf_size: usize,
+    user: &str,
+    stats: Arc<Stats>,
+    quota_limit: Option<u64>,
+    _buffer_pool: Arc<BufferPool>,
+    activity_timeout: Duration,
+) -> Result<()>
+where
+    CR: AsyncRead + Unpin + Send + 'static,
+    CW: AsyncWrite + Unpin + Send + 'static,
+    SR: AsyncRead + Unpin + Send + 'static,
+    SW: AsyncWrite + Unpin + Send + 'static,
+{
+    let activity_timeout = activity_timeout.max(Duration::from_secs(1));
     let epoch = Instant::now();
     let counters = Arc::new(SharedCounters::new());
     let quota_exceeded = Arc::new(AtomicBool::new(false));
@@ -512,7 +662,7 @@ where
             }
 
             // ── Activity timeout ────────────────────────────────────
-            if idle >= ACTIVITY_TIMEOUT {
+            if idle >= activity_timeout {
                 let c2s = wd_counters.c2s_bytes.load(Ordering::Relaxed);
                 let s2c = wd_counters.s2c_bytes.load(Ordering::Relaxed);
                 warn!(
@@ -671,3 +821,7 @@ mod relay_watchdog_delta_security_tests;
 #[cfg(test)]
 #[path = "tests/relay_atomic_quota_invariant_tests.rs"]
 mod relay_atomic_quota_invariant_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_baseline_invariant_tests.rs"]
+mod relay_baseline_invariant_tests;
