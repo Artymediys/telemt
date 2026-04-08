@@ -47,8 +47,6 @@
 - [Config parameters](docs/Config_params)
 - [Build](#build)
 - [Why Rust?](#why-rust)
-- [Issues](#issues)
-- [Roadmap](#roadmap)
 
 ## Quick Start Guide
 - [Quick Start Guide RU](docs/Quick_start/QUICK_START_GUIDE.ru.md)
