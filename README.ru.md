@@ -18,13 +18,15 @@
 
 **Telemt** — это быстрый, безопасный и функциональный сервер, написанный на Rust. Он полностью реализует официальный алгоритм прокси Telegram и добавляет множество улучшений для продакшена:
 
-- [ME Pool + Reader/Writer + Registry + Refill + Adaptive Floor + Trio-State + жизненный цикл генераций](https://github.com/telemt/telemt/blob/main/docs/Architecture/Model/MODEL.en.md);
-- [Полноценный API с управлением](https://github.com/telemt/telemt/blob/main/docs/Architecture/API/API.md);
-- Защита от повторных атак (Anti-Replay on Sliding Window);
-- Метрики в формате Prometheus;
-- TLS-fronting и TCP-splicing для маскировки от DPI.
+## Установка и обновление одной командой
 
-## Особенности
+```bash
+curl -fsSL https://raw.githubusercontent.com/telemt/telemt/main/install.sh | sh
+```
+
+- [Инструкция по быстрому запуску](docs/Quick_start/QUICK_START_GUIDE.ru.md)
+- [Quick Start Guide](docs/Quick_start/QUICK_START_GUIDE.en.md)
+
 Реализация **TLS-fronting** максимально приближена к поведению реального HTTPS-трафика (подробнее - [FAQ](docs/FAQ.ru.md#распознаваемость-для-dpi-и-сканеров)).
 
 ***Middle-End Pool*** оптимизирован для высокой производительности.
@@ -39,27 +41,14 @@
 - Корректное завершение работы (Ctrl+C);
 - Подробное логирование через `trace` и `debug`.
 
-
-## Быстрая установка (обновление при повторном запуске)
-```bash
-curl -fsSL https://raw.githubusercontent.com/telemt/telemt/main/install.sh | sh
-```
-
-Подробнее об установке в [Quick Start Guide](docs/Quick_start/QUICK_START_GUIDE.ru.md).
-
-# Навигация
+# Подробнее о Telemt
 - [FAQ](#faq)
 - [Архитектура](docs/Architecture)
 - [Быстрый старт](#quick-start-guide)
 - [Параметры конфигурационного файла](docs/Config_params)
 - [Сборка](#build)
+- [Установка на BSD](#openbsd)
 - [Почему Rust?](#why-rust)
-- [Известные проблемы](#issues)
-- [Планы](#roadmap)
-
-## Быстрый старт
-- [Quick Start Guide RU](docs/Quick_start/QUICK_START_GUIDE.ru.md)
-- [Quick Start Guide EN](docs/Quick_start/QUICK_START_GUIDE.en.md)
 
 ## FAQ
 - [FAQ RU](docs/FAQ.ru.md)
@@ -87,7 +76,7 @@ chmod +x /bin/telemt
 telemt config.toml
 ```
 
-## OpenBSD
+## Установка на BSD
 - Руководство по сборке и настройке на английском языке [OpenBSD Guide (EN)](docs/Quick_start/OPENBSD_QUICK_START_GUIDE.en.md);
 - Пример rc.d скрипта: [contrib/openbsd/telemt.rcd](contrib/openbsd/telemt.rcd);
 - Поддержка sandbox с `pledge(2)` и `unveil(2)` пока не реализована.
