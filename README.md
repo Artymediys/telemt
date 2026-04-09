@@ -9,7 +9,7 @@
 > Fixed TLS ClientHello is now available:
 > - in **Telegram Desktop** starting from version **6.7.2**;
 > - in **Telegram Android Client** starting from version **12.6.4**;
-> - in **Telegram for iOS** starting from version **12.6.2**
+> - in **Telegram for iOS** starting from version **12.6.2**.
 >
 > To work with EE-MTProxy, please update your client!
 
