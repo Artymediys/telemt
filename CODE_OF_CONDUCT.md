@@ -150,7 +150,7 @@ All decisions are expected to serve the durability, clarity, and integrity of Te
 
 > **Klarheit vor Zustimmung - Bestand vor Beifall**
 
-> Clarity before approval - passed before applause
+> Clarity above approval - substantiality before success
 ---
 
 ## Enforcement
