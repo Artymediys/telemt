@@ -4,10 +4,7 @@
 
 > [!NOTE]
 >
-> Fixed TLS ClientHello is now available:
-> - in **Telegram Desktop** starting from version **6.7.2**
-> - in **Telegram Android Client** starting from version **12.6.4**
-> - **release for iOS is "work in progress"**
+> Fixed TLS ClientHello is now available in official clients for Desktop / Android / iOS
 >
 > To work with EE-MTProxy, please update your client!
 
@@ -17,12 +14,14 @@
   </a>
 </p>
 
-**Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements such as:
-- [ME Pool + Reader/Writer + Registry + Refill + Adaptive Floor + Trio-State + Generation Lifecycle](https://github.com/telemt/telemt/blob/main/docs/Architecture/Model/MODEL.en.md);
-- [Full-covered API w/ management](https://github.com/telemt/telemt/blob/main/docs/Architecture/API/API.md);
-- Anti-Replay on Sliding Window;
-- Prometheus-format Metrics;
-- TLS-Fronting and TCP-Splicing for masking from "prying" eyes.
+**Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements
+
+### One-command Install and Update / Команда для установки и обновления в одно касание
+```bash
+curl -fsSL https://raw.githubusercontent.com/telemt/telemt/main/install.sh | sh
+```
+- [Quick Start Guide](docs/Quick_start/QUICK_START_GUIDE.en.md)
+- [Инструкция по быстрому запуску](docs/Quick_start/QUICK_START_GUIDE.ru.md)
 
 ![telemt_scheme](docs/assets/telemt.png)
 
@@ -39,12 +38,6 @@ Our ***Middle-End Pool*** is fastest by design in standard scenarios, compared t
 - Configurable keepalives + timeouts + IPv6 and "Fast Mode";
 - Graceful shutdown on Ctrl+C;
 - Extensive logging via `trace` and `debug` with `RUST_LOG` method.
-
-## One-command installation (update on re-ru)
-```bash
-curl -fsSL https://raw.githubusercontent.com/telemt/telemt/main/install.sh | sh
-```
-See more in the [Quick Start Guide](docs/Quick_start/QUICK_START_GUIDE.en.md).
 
 # GOTO
 - [FAQ](#faq)
